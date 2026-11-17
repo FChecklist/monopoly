@@ -6,6 +6,12 @@ on:
       seeds_per_shard:
         description: "seeds in each shard"
         default: "3"
+      only_variant:
+        description: "optional: run only this variant (e.g. mnp)"
+        default: ""
+      repeat_seeds:
+        description: "optional: explicit seed list to run in every shard of only_variant (e.g. 107,107,107,107,107)"
+        default: ""
 permissions:
   contents: read
 jobs:
@@ -27,7 +33,11 @@ jobs:
           PER: ${{ github.event.inputs.seeds_per_shard || '3' }}
           SHARD: ${{ matrix.shard }}
           VARIANT: ${{ matrix.variant }}
+          ONLY: ${{ github.event.inputs.only_variant }}
+          REPEAT: ${{ github.event.inputs.repeat_seeds }}
         run: |
+          if [ -n "$ONLY" ] && [ "$ONLY" != "$VARIANT" ]; then echo skip; exit 0; fi
+          if [ -n "$REPEAT" ]; then node scripts/sim.mjs "$REPEAT" "$VARIANT"; exit $?; fi
           SEEDS=$(node -e 'const p=+process.env.PER,s=+process.env.SHARD;console.log(Array.from({length:p},(_,i)=>100+s*p+i).join(","))')
           echo "variant=$VARIANT seeds=$SEEDS"
           node scripts/sim.mjs "$SEEDS" "$VARIANT"
