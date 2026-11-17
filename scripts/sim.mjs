@@ -213,6 +213,9 @@ async function run({ seed, variant, days = 100 }) {
         const mine = evs.filter((e) => per.periodOf(t.period, e.occurred_at, 4).key === pk).length;
         const tier = P.tierReached(tiers, mine);
         const net = (await w.db.first("SELECT COALESCE(SUM(amount),0) s FROM reward WHERE group_key=? AND person_id=? AND state IN ('queued','sent','waiting','recorded')", g.group_key, g.person_id)).s;
+        // Model: a period whose last instant lies in no published season (the season closed before a late event changed the count) cannot be funded; the row is kept as it was paid.
+        const pend = per.periodOf(t.period, evs.find((e) => per.periodOf(t.period, e.occurred_at, 4).key === pk)?.occurred_at ?? 0, 4).end;
+        if (net !== (tier?.bonus ?? 0) && !(await Rw.seasonAt(ctx, w.company.id, pend - 1))) continue;
         if (net !== (tier?.bonus ?? 0)) {
           const rr = await w.db.all("SELECT id,kind,state,amount,reversed,attempts,last_error,idem_key,created_at,event_id FROM reward WHERE group_key=? AND person_id=? ORDER BY rowid", g.group_key, g.person_id);
           const ee = await w.db.all("SELECT id,status,reversal_kind,reversal_due,reversal_appeal,occurred_at FROM event WHERE person_id=? AND event_type=? AND stage=? ORDER BY occurred_at", g.person_id, t.event_type, t.stage);

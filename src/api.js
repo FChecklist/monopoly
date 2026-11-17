@@ -421,6 +421,7 @@ route('GET', '/api/admin/overview', async (c) => {
     rewards_waiting_budget: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting'", cid),
     open_corrections: await q("SELECT COUNT(*) n FROM correction WHERE company_id = ? AND state IN ('open','frozen')", cid),
     penalties_open: await q("SELECT COUNT(*) n FROM penalty_case WHERE company_id = ? AND state IN ('proposed','pending','appealed')", cid),
+    open_handbacks_failed: await q("SELECT COUNT(*) n FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state = 'failed') >= 5", cid),
     rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
     season: await c.ctx.db.first("SELECT id, name, budget, ends_at FROM season WHERE company_id = ? AND status = 'published' ORDER BY starts_at DESC LIMIT 1", cid),

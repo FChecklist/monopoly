@@ -140,6 +140,9 @@ export async function grant(ctx, company, p) {
   return { paid: 0, reason: 'busy' };
 }
 
+// Codes that describe the provider or its configuration, not this person's account: never a reason to fail a reward for good.
+const TRANSIENT = new Set(['unsupported', 'unauthorized', 'misconfigured', 'bad_config', 'timeout', 'rate_limited', 'provider_down', 'unavailable']);
+const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
 export async function sendReward(ctx, company, r) {
   if (r.state !== 'queued') return r;
@@ -163,7 +166,7 @@ export async function sendReward(ctx, company, r) {
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, sent_amount=?, last_error=? WHERE id=? AND state='queued'", res.entry_id ?? r.idem_key, ctx.now(), got, got < r.sent_amount ? 'partial_grant' : null, r.id);
   } catch (e) {
     if (!(e instanceof ProviderError)) throw e;
-    if (e.retriable) await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id);
+    if (e.retriable || isTransient(e.code)) await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id); // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
     else if (e.code === 'insufficient_budget' || e.code === 'hold_expired') await backToWaiting(ctx, company, r, e.code);
     else await failReward(ctx, company, r, e.code);
   }
@@ -200,7 +203,27 @@ export async function retryQueued(ctx, company, limit = 100) {
     if (out.state === 'sent') sent++;
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
   }
+  await releaseClosedHolds(ctx, company);
   return { sent, stuck };
+}
+
+/**
+ * A season closed while some of its rewards were still queued (provider outage) keeps its budget hold, because those rewards draw from it.
+ * Once none is queued any more the hold is released and forgotten. Idempotent; a provider problem just leaves it for the next tick.
+ */
+export async function releaseClosedHolds(ctx, company) {
+  let released = 0;
+  const pending = await ctx.db.all("SELECT s.* FROM season s WHERE s.company_id=? AND s.status='closed' AND s.hold_id IS NOT NULL AND EXISTS (SELECT 1 FROM audit a WHERE a.company_id=s.company_id AND a.action='season.close' AND instr(a.data, '\"deferred\":true') > 0 AND instr(a.data, '\"id\":\"' || s.id || '\"') > 0) AND NOT EXISTS (SELECT 1 FROM audit a WHERE a.company_id=s.company_id AND a.action='season.hold_released' AND instr(a.data, '\"id\":\"' || s.id || '\"') > 0)", company.id);
+  for (const se of pending) {
+    if ((await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE season_id=? AND state='queued'", se.id)).n > 0) continue;
+    try {
+      const prov = ctx.provider(company);
+      if ((await prov.capabilities()).hold) await prov.releaseHold({ holdId: se.hold_id });
+    } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') continue; }
+    await commit(ctx, company.id, 'system', 'season.hold_released', { id: se.id });
+    released++;
+  }
+  return released;
 }
 
 /**

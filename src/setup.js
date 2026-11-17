@@ -2,7 +2,7 @@
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
-import { accountRef } from './rewards.js';
+import { accountRef, retryQueued } from './rewards.js';
 import { ProviderError } from './provider/errors.js';
 
 const must = (actor, ...roles) => { if (!roles.includes(actor.role)) throw new ApiError(403, 'not_allowed', 'You cannot do this.'); };
@@ -124,11 +124,15 @@ export async function closeSeason(ctx, company, actor, seasonId) {
   must(actor, 'admin');
   const s = await ctx.db.first("SELECT * FROM season WHERE id=? AND company_id=? AND status='published'", seasonId, company.id);
   if (!s) throw new ApiError(404, 'no_season', 'No published season.');
-  let released = 0;
+  let released = 0, deferred = false;
   const prov = ctx.provider(company);
-  if (s.hold_id && (await prov.capabilities()).hold) released = (await prov.releaseHold({ holdId: s.hold_id })).released; // unused budget goes back to the company
-  await commit(ctx, company.id, actor.id, 'season.close', { id: s.id, released }, [["UPDATE season SET status='closed' WHERE id=?", s.id]]);
-  return { released };
+  // Rewards of this season that are queued (a provider outage kept them) still draw from its hold. Try them once; if any is still on its way
+  // the hold stays until the tick has sent them (releaseClosedHolds), so closing a season never turns earned rewards into voids.
+  try { await retryQueued(ctx, company, 1000); } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  if ((await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE season_id=? AND state='queued'", s.id)).n > 0) deferred = true;
+  else if (s.hold_id && (await prov.capabilities()).hold) released = (await prov.releaseHold({ holdId: s.hold_id })).released; // unused budget goes back to the company
+  await commit(ctx, company.id, actor.id, 'season.close', deferred ? { id: s.id, released, deferred: true } : { id: s.id, released }, [["UPDATE season SET status='closed' WHERE id=?", s.id]]);
+  return deferred ? { released, hold_pending: true } : { released };
 }
 
 // ---------- surprise notes, desks, penalty rules ----------

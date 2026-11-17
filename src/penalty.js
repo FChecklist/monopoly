@@ -171,14 +171,36 @@ export async function restoreDebit(ctx, company, caseId, credits, gen) {
   if (!now) return;
   if (['applied', 'appealed', 'upheld'].includes(now.state) && now.applied_credits > 0) return;
   if (now.state === 'reversed' && now.applied_credits > 0) return; // the winner recorded this debit; the penrev: hand-back owns it
+  if (gen === undefined) gen = await restoresOf(ctx, company, caseId); // direct callers only; applyPenalty passes the generation it debited with
+  const key = 'penrestore:' + caseId + (gen ? ':g' + gen : '');
   try {
-    if (gen === undefined) gen = await restoresOf(ctx, company, caseId); // direct callers only; applyPenalty passes the generation it debited with
-    const key = 'penrestore:' + caseId + (gen ? ':g' + gen : '');
     if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n > 0) return; // this restore is already recorded
     const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', now.person_id);
     await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: credits, reasonCode: 'penalty_restore', ref: caseId, idem: key });
     await commit(ctx, company.id, 'system', 'penalty.restore', { id: caseId, credits, key }); // the debit is over: a later debit of this case is a NEW debit (new key)
-  } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  } catch (e) {
+    if (!(e instanceof ProviderError)) throw e;
+    // The debit exists at the provider but its hand-back did not land: write that down, so the tick finishes it (same key, so once only).
+    try { await commit(ctx, company.id, 'system', 'penalty.restore_pending', { id: caseId, credits, key, code: e.code }); } catch { /* the next try writes it again */ }
+  }
+}
+
+/** Finish restores that were cut short (provider down while a lost-race debit was being handed back). Idempotent: same key as the first try. */
+async function finishRestores(ctx, company) {
+  let done = 0;
+  const rows = await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.restore_pending' ORDER BY n", company.id);
+  const seen = new Set();
+  for (const r of rows) {
+    let d; try { d = JSON.parse(r.data); } catch { continue; }
+    if (!d?.key || seen.has(d.key)) continue; seen.add(d.key);
+    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action IN ('penalty.restore','penalty.restore_skipped') AND instr(data, ?) > 0", company.id, `"key":"${d.key}"`)).n > 0) continue;
+    const c = await ctx.db.first('SELECT state, applied_credits FROM penalty_case WHERE id = ?', d.id);
+    if (!c || c.applied_credits > 0) { await commit(ctx, company.id, 'system', 'penalty.restore_skipped', { id: d.id, key: d.key }); continue; } // the winner recorded this debit: nothing to restore
+    const g = d.key.includes(':g') ? Number(d.key.split(':g')[1]) : 0;
+    await restoreDebit(ctx, company, d.id, d.credits, g);
+    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${d.key}"`)).n > 0) done++;
+  }
+  return done;
 }
 
 const MAX_HANDBACK_TRIES = 5;
@@ -232,6 +254,7 @@ async function reversePenalty(ctx, company, c0, actorId, note, code = 'custom') 
 export async function tickPenalties(ctx, company) {
   const now = ctx.now(), out = { applied: 0, escalated: 0, reversed: 0, errors: 0, repaired: 0 };
   // A reversal that committed but whose credit hand-back never landed (crash, contention): the penrev: reward is missing. Run it again (idempotent).
+  try { out.repaired += await finishRestores(ctx, company); } catch { out.errors++; }
   for (const c of await ctx.db.all("SELECT * FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE " + PENREV_ROWS + " AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE " + PENREV_ROWS + " AND r.state = 'failed') < " + MAX_HANDBACK_TRIES, company.id)) {
     try { if (await handBack(ctx, company, c, 'system')) out.repaired++; } catch (e) { out.errors++; }
   }

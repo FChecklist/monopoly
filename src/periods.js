@@ -51,8 +51,11 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     const rows = await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=0 AND amount>0 AND kind != 'reversal' AND state IN ('queued','sent','waiting') ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
     for (const r of rows) {
       if (paid <= entitled) break;
+      // Reversing a whole row may overshoot; the difference is paid again below. When no published season covers the period (it closed),
+      // that top-up could not be placed and the person would end with LESS than earned: keep the row, the person is overpaid, never underpaid.
+      if (paid - r.amount < entitled && !(await seasonAt(ctx, company.id, at))) { out.kept = (out.kept ?? 0) + 1; continue; }
       const o = await reverseReward(ctx, company, r, { reason: 'tier_lost:' + (label ?? kind), actor: 'system' });
-      if (o.skipped) continue; // not confirmed yet (provider still has to answer): leave it for the next close
+      if (o.skipped) { out.skipped = (out.skipped ?? 0) + 1; out.skipCode = o.code ?? out.skipCode ?? 'pending'; continue; } // not confirmed yet (provider still has to answer): leave it for the next close
       out.reversed += r.amount;
       paid -= r.amount;
     }
@@ -69,9 +72,12 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     const gen = snap.gen;
     // `p${paid}` is what is already counted: a capped or partly paid earlier grant moved it, so the next run tops up the rest
     // under a new key; a voided earlier grant did not, so it replays (a void row is never paid a second time).
-    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}`;
+    // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
+    const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n;
+    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale ? `:x${stale}` : '');
     const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system' });
     out.paid = g.paid;
+    if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';
   }
   return out;
 }
@@ -100,6 +106,12 @@ async function safeSettle(ctx, company, report, args) {
   if (!isReversal && at !== null && ctx.now() - at < BLOCK_TTL) { report.blocked = (report.blocked ?? 0) + 1; return { paid: 0, reversed: 0 }; }
   try {
     const out = await settleEntitlement(ctx, company, args);
+    if (out.skipped) { report.reversal_skipped = (report.reversal_skipped ?? 0) + out.skipped; await commit(ctx, company.id, 'system', 'period.settle_error', { kind: args.kind, group: args.groupKey, code: 'reverse_pending_' + out.skipCode }); }
+    if (out.kept) report.reversal_kept = (report.reversal_kept ?? 0) + out.kept;
+    if (out.failedCode) { // the pay entry failed for good (account error): make it visible and wait out the block time before the next, new-key try
+      await commit(ctx, company.id, 'system', 'period.settle_blocked', { key, kind: args.kind, code: out.failedCode });
+      report.blocked = (report.blocked ?? 0) + 1; return out;
+    }
     if (at !== null) { await commit(ctx, company.id, 'system', 'period.settle_unblocked', { key, kind: args.kind }); report.unblocked = (report.unblocked ?? 0) + 1; }
     return out;
   } catch (e) {
