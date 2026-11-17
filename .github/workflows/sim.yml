@@ -1,0 +1,33 @@
+# Whole-month simulation, sharded across GitHub's free servers. Tests only: no secrets, never deploys.
+name: simulation
+on:
+  workflow_dispatch:
+    inputs:
+      seeds_per_shard:
+        description: "seeds in each shard"
+        default: "3"
+permissions:
+  contents: read
+jobs:
+  sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, mnp, dice, tight, budget]
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: run seeds
+        env:
+          PER: ${{ github.event.inputs.seeds_per_shard || '3' }}
+          SHARD: ${{ matrix.shard }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          SEEDS=$(node -e 'const p=+process.env.PER,s=+process.env.SHARD;console.log(Array.from({length:p},(_,i)=>100+s*p+i).join(","))')
+          echo "variant=$VARIANT seeds=$SEEDS"
+          node scripts/sim.mjs "$SEEDS" "$VARIANT"
