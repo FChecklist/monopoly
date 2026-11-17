@@ -216,10 +216,12 @@ async function run({ seed, variant, days = 100 }) {
         if (net !== (tier?.bonus ?? 0)) {
           const rr = await w.db.all("SELECT id,kind,state,amount,reversed,attempts,last_error,idem_key,created_at,event_id FROM reward WHERE group_key=? AND person_id=? ORDER BY rowid", g.group_key, g.person_id);
           const ee = await w.db.all("SELECT id,status,reversal_kind,reversal_due,reversal_appeal,occurred_at FROM event WHERE person_id=? AND event_type=? AND stage=? ORDER BY occurred_at", g.person_id, t.event_type, t.stage);
-          const sh = (x) => String(x ?? '').slice(-6);
-          for (const r of rr) console.log(`DIAG rw ${sh(r.id)} ${r.kind} ${r.state} amt=${r.amount} rev=${r.reversed} att=${r.attempts} err=${r.last_error ?? ''} key=${String(r.idem_key).split(':').slice(3).join(':')} ct=${r.created_at}`);
-          for (const e of ee) console.log(`DIAG ev ${sh(e.id)} ${e.status} k=${e.reversal_kind ?? ''} due=${e.reversal_due ?? ''} app=${e.reversal_appeal ?? ''} occ=${e.occurred_at}`);
-          console.log(`DIAG period=${pk} tgtperiod=${t.period} now=${w.clock.t}`);
+          const sh = (x) => String(x ?? '').slice(-4), d = (x) => ((x - T0) / DAY).toFixed(1);
+          const ss = await w.db.all("SELECT id,status,starts_at,ends_at FROM season ORDER BY starts_at");
+          console.log('DIAG seasons ' + ss.map((x) => `${sh(x.id)}:${x.status[0]}:${d(x.starts_at)}..${d(x.ends_at)}`).join(' '));
+          for (const r of rr) console.log(`DIAG rw ${sh(r.id)} ${r.kind[0]} ${r.state} ${r.amount} r${r.reversed} a${r.attempts} ${r.last_error ?? '-'} d${d(r.created_at)} ${String(r.idem_key).split(':').slice(4).join(':')}`);
+          for (const e of ee) console.log(`DIAG ev ${sh(e.id)} ${e.status} d${d(e.occurred_at)}${e.reversal_kind ? ' ' + e.reversal_kind : ''}`);
+          console.log(`DIAG pk=${pk} now=d${d(w.clock.t)}`);
         }
         if (net !== (tier?.bonus ?? 0)) V(`tier ${g.group_key} p=${g.person_id} net ${net} != entitled ${tier?.bonus ?? 0} (count ${mine})`);
       }
