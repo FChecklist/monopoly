@@ -1,0 +1,25 @@
+# Free-tier CI. Tests only. It never deploys and uses no secrets.
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --version
+      - run: node scripts/scan-words.js
+      - run: node scripts/scan-secrets.js
+      - run: node scripts/make-openapi.js --check
+      - run: npm test

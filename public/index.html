@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Office floor game</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div id="demo" class="demo" hidden></div>
+<header id="top" class="top"></header>
+<main id="main" tabindex="-1"><p class="muted pad">Loading...</p></main>
+<footer id="foot" class="foot"></footer>
+<div id="toast" class="toast" hidden>
+  <p id="toast-msg" role="status" aria-live="polite"></p>
+  <button type="button" id="toast-x" class="ghost" aria-label="Dismiss message">Close</button>
+</div>
+<dialog id="dlg" class="dlg" aria-labelledby="dlg-title">
+  <form method="dialog" id="dlg-form">
+    <h2 id="dlg-title"></h2>
+    <p id="dlg-msg"></p>
+    <div id="dlg-field"></div>
+    <div class="row end">
+      <button type="button" id="dlg-no" class="ghost">Cancel</button>
+      <button type="submit" id="dlg-ok" class="primary">OK</button>
+    </div>
+  </form>
+</dialog>
+<script src="/board.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

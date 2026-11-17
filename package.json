@@ -1,0 +1,16 @@
+{
+  "name": "corporate-floor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Office target and reward game. Standalone product. Talks to a credit provider only through one adapter. Stores no credit balances.",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "scan": "node scripts/scan-words.js",
+    "secrets": "node scripts/scan-secrets.js",
+    "dev": "node scripts/dev-server.js",
+    "newco": "node scripts/new-company.js"
+  },
+  "engines": { "node": ">=22.5" }
+}

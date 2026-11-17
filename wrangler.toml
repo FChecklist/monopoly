@@ -1,0 +1,11 @@
+# Cloudflare Pages project "monopoly" (free tier). Secrets are set with `wrangler pages secret put`, never in this file:
+#   SEAL_KEY, MASTER_SECRET, PLATFORM_TOKEN, ALLOW_DEMO_PROVIDER (demo only), MNP_BASE_URL, MNP_KEY_ID, MNP_SECRET
+name = "monopoly"
+compatibility_date = "2026-11-01"
+pages_build_output_dir = "public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "monopoly"
+database_id = "00000000-0000-0000-0000-000000000000" # replaced at deploy time by the real id
+migrations_dir = "migrations"
