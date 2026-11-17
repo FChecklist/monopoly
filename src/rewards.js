@@ -7,7 +7,7 @@
 import { settingsOf, DEFAULTS } from './config.js';
 import { commit } from './audit.js';
 import { newId, monthKey, dayKey, DAY } from './util.js';
-import { ProviderError } from './provider/errors.js';
+import { ProviderError, RETRIABLE_CODES } from './provider/errors.js';
 
 const COUNT = "('queued','sent','waiting','recorded')";
 const FUNDED = "('queued','sent')";
@@ -141,8 +141,9 @@ export async function grant(ctx, company, p) {
 }
 
 // Codes that describe the provider or its configuration, not this person's account: never a reason to fail a reward for good.
-const TRANSIENT = new Set(['unsupported', 'unauthorized', 'misconfigured', 'bad_config', 'timeout', 'rate_limited', 'provider_down', 'unavailable']);
-const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
+// insufficient_credits on a CREDIT call can only mean the tenant side is out of funds (API.md has no person-level 402 on /v1/credit): it waits, it never fails the row.
+export const TRANSIENT = new Set([...RETRIABLE_CODES, 'unsupported', 'insufficient_credits']);
+export const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
 export async function sendReward(ctx, company, r) {
   if (r.state !== 'queued') return r;
@@ -166,7 +167,11 @@ export async function sendReward(ctx, company, r) {
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, sent_amount=?, last_error=? WHERE id=? AND state='queued'", res.entry_id ?? r.idem_key, ctx.now(), got, got < r.sent_amount ? 'partial_grant' : null, r.id);
   } catch (e) {
     if (!(e instanceof ProviderError)) throw e;
-    if (e.retriable || isTransient(e.code)) await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id); // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
+    if (e.retriable || isTransient(e.code)) { // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
+      await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id);
+      // One audit line per CHANGE of code (not per try), so a long outage never grows the audit chain.
+      if (r.last_error !== e.code) { try { await commit(ctx, company.id, 'system', 'reward.send_error', { id: r.id, code: e.code }); } catch { /* the next try writes it */ } }
+    }
     else if (e.code === 'insufficient_budget' || e.code === 'hold_expired') await backToWaiting(ctx, company, r, e.code);
     else await failReward(ctx, company, r, e.code);
   }
@@ -184,6 +189,11 @@ async function backToWaiting(ctx, company, r, code) {
   await commit(ctx, company.id, 'system', 'reward.waiting', { id: r.id, code }, stmts, { onlyIfChanged: true });
 }
 
+/**
+ * A reward fails for good ONLY from a definitive 4xx rejection Moneypenny gave for THIS call (API.md: "a failed call leaves no trace, so its key can be reused").
+ * Config, auth, network, 5xx, timeout and bad-body errors are transient and never reach here. So a revived row reuses the SAME idempotency key:
+ * if the first credit had somehow landed, the provider replays it and nothing is paid twice.
+ */
 async function failReward(ctx, company, r, code) {
   const n = JSON.parse(r.note || '{}');
   // Give the corrections back first, guarded on the row still being queued, then flip the row. All or nothing.
@@ -192,6 +202,28 @@ async function failReward(ctx, company, r, code) {
   for (const [cid, t] of n.takes ?? []) stmts.push([`UPDATE correction SET recovered = MAX(0, recovered - ?), state = CASE WHEN state = 'cleared' THEN 'open' ELSE state END WHERE id = ? AND ${own}`, t, cid, r.id]);
   stmts.push(["UPDATE reward SET state='failed', last_error=? WHERE id=? AND state='queued'", code, r.id]);
   await commit(ctx, company.id, 'system', 'reward.failed', { id: r.id, code }, stmts);
+}
+
+const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1)"; // period rows with one try revive themselves under a new key (x<n>) after the block time
+const MAX_REVIVES = 5;
+/** Failed event rewards (and period rows tried more than once) that wait for an admin. Shown as open_failed_rewards in the overview. */
+export const openFailedRewards = async (ctx, companyId) => (await ctx.db.first('SELECT COUNT(*) n FROM reward WHERE ' + REVIVABLE, companyId)).n;
+/**
+ * Admin helper, like clearBlocked: put every failed event reward back to 'waiting'; releaseWaiting then runs the whole check again and sends it.
+ * It keeps the SAME idempotency key (see failReward), so it cannot pay twice. A row is revived at most MAX_REVIVES times.
+ */
+export async function reviveFailedRewards(ctx, company, actor = 'admin') {
+  let revived = 0;
+  for (const r of await ctx.db.all('SELECT * FROM reward WHERE ' + REVIVABLE + ' ORDER BY created_at', company.id)) {
+    const n = JSON.parse(r.note || '{}');
+    if ((n.revives ?? 0) >= MAX_REVIVES) continue;
+    const note = JSON.stringify({ ...n, offset: 0, takes: [], revives: (n.revives ?? 0) + 1 });
+    const stmts = [["UPDATE reward SET state='waiting', last_error='revived', sent_amount=amount, note=? WHERE id=? AND state='failed'", note, r.id]];
+    const res = await commit(ctx, company.id, actor, 'reward.revived', { id: r.id, was: r.last_error }, stmts, { onlyIfChanged: true });
+    if (res[res.length - 1].changes > 0) revived++;
+  }
+  const rel = revived ? await releaseWaiting(ctx, company) : { moved: 0, voided: 0 };
+  return { revived, ...rel };
 }
 
 /** Retry everything that is "on its way". Run by the admin button and by the scheduled trigger. */

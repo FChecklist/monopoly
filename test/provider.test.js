@@ -22,8 +22,9 @@ function fakeMoneypenny({ down = false } = {}) {
     calls++;
     if (impl.down) throw new Error('network');
     const u = new URL(url), path = u.pathname + u.search, h = init.headers, body = init.body ?? '';
-    const expect = await hmacHex(SECRET, [h['x-mnp-timestamp'], h['x-mnp-nonce'], init.method, path, await sha256Hex(body)].join('\n'));
-    const reply = (status, j, extra = {}) => ({ ok: status < 300, status, headers: { get: (k) => extra[k] ?? null }, json: async () => j });
+    const expect = await hmacHex(SECRET, [h['x-mnp-timestamp'], h['x-mnp-nonce'], init.method, path, await sha256Hex(body), h['idempotency-key'] ?? ''].join('\n'));
+    const reply = (status, j, extra = {}) => ({ ok: status < 300, status, headers: { get: (k) => extra[k] ?? null }, json: async () => { if (j === undefined) throw new SyntaxError('not json'); return j; } });
+    if (impl.override) { const o = impl.override(u.pathname, init, reply); if (o) return o; } // tests: force a status / body
     if (h['x-mnp-key'] !== 'mk_test' || h['x-mnp-signature'] !== expect) return reply(401, { ok: false, error: { code: 'bad_signature' } });
     if (Math.abs(Date.now() - Number(h['x-mnp-timestamp'])) > 300000) return reply(401, { ok: false, error: { code: 'stale_timestamp' } });
     if (seenNonce.has(h['x-mnp-nonce'])) return reply(401, { ok: false, error: { code: 'replayed' } });
@@ -131,4 +132,75 @@ test('a pending correction (credits already spent) is paid down by smaller later
   await submitEvent(ctx, company, SYSTEM, { person_id: a.id, event_type: 'game', stage: 'completed', ext_id: 'sp3', source: 'api', occurred_at: w.clock.t });
   assert.equal((await w.db.first('SELECT state FROM correction')).state, 'cleared');
   assert.equal((await w.db.first("SELECT COUNT(*) n FROM penalty_case")).n, 0, 'not counted as a penalty');
+});
+
+// ---- round 10: status mapping and the fate of queued rewards ----
+import { reviveFailedRewards, openFailedRewards } from '../src/rewards.js';
+const codeOf = async (f, over) => { f.override = over; try { await mnp(f).credit({ accountRef: 'x@y.test', amount: 5, ref: 'r', idem: 'k' + Math.random() }); return null; } catch (e) { return e; } finally { f.override = null; } };
+const answer = (status, code) => (path, init, reply) => (path === '/v1/credit' ? reply(status, status < 300 ? undefined : { ok: false, error: code ? { code } : undefined }) : null);
+
+test('R10-1: the adapter maps every status to a code the game classifies correctly', async () => {
+  const table = [
+    [401, undefined, 'unauthorized', true], [401, 'stale_timestamp', 'unauthorized', true], [401, 'replayed', 'unauthorized', true],
+    [403, undefined, 'unauthorized', true], [408, undefined, 'unauthorized', true], [425, undefined, 'unauthorized', true],
+    [403, 'account_frozen', 'account_closed', false],
+    [404, undefined, 'misconfigured', true], [404, 'not_found', 'misconfigured', true], [409, undefined, 'misconfigured', true],
+    [404, 'no_account', 'account_closed', false], [409, 'idempotency_conflict', 'bad_request', false],
+    [402, undefined, 'insufficient_credits', false], [402, 'insufficient_credits', 'insufficient_credits', false],
+    [429, undefined, 'rate_limited', true], [500, undefined, 'provider_down', true], [503, 'whatever', 'provider_down', true],
+    [400, undefined, 'bad_request', false], [422, 'mystery', 'bad_request', false], [422, 'below_minimum', 'bad_request', false], [400, 'bad_email', 'bad_request', false],
+  ];
+  for (const [status, body, want, retriable] of table) {
+    const e = await codeOf(fakeMoneypenny(), answer(status, body));
+    assert.ok(e instanceof ProviderError, `${status}/${body}`);
+    assert.equal(e.code, want, `${status}/${body}`); assert.equal(e.retriable, retriable, `${status}/${body} retriable`);
+  }
+});
+test('R10-2: a timeout is "timeout" (transient) and a 200 that is not JSON is "bad_response" (transient), never a TypeError', async () => {
+  const f = fakeMoneypenny();
+  const t = await codeOf(f, () => { throw Object.assign(new Error('x'), { name: 'TimeoutError' }); });
+  assert.equal(t.code, 'timeout'); assert.equal(t.retriable, true);
+  const n = await codeOf(f, (path, init, reply) => (path === '/v1/credit' ? reply(200, undefined) : null));
+  assert.ok(n instanceof ProviderError); assert.equal(n.code, 'bad_response'); assert.equal(n.retriable, true);
+});
+
+test('R10-3: config / auth / clock faults keep event rewards queued (one audit line per code), and they are paid once after recovery', async () => {
+  for (const [name, over] of [['401', answer(401, 'stale_timestamp')], ['403', answer(403)], ['404', answer(404)], ['409', answer(409)], ['408', answer(408)], ['402', answer(402, 'insufficient_credits')], ['429', answer(429)], ['500', answer(500)],
+    ['timeout', () => { throw Object.assign(new Error('t'), { name: 'TimeoutError' }); }], ['non-json', (p, i, reply) => (p === '/v1/credit' ? reply(200, undefined) : null)]]) {
+    const f = fakeMoneypenny();
+    const w = await world({ providerOverride: () => mnp(f), settings: { daily_event_limit: 1000 } });
+    await w.db.run("UPDATE company SET provider = 'moneypenny'"); await w.reload(); await exampleCard(w);
+    f.override = over;
+    const r = await submitEvent(w.ctx, w.company, SYSTEM, { person_id: w.people.a.id, event_type: 'game', stage: 'completed', ext_id: 'cfg' + name, source: 'api', occurred_at: w.clock.t });
+    assert.ok(r.ok, name);
+    for (let i = 0; i < 4; i++) await retryQueued(w.ctx, w.company);
+    const row = await w.db.first('SELECT state, last_error, attempts FROM reward WHERE person_id = ?', w.people.a.id);
+    assert.equal(row.state, 'queued', name + ' stays queued'); assert.ok(row.attempts >= 4);
+    assert.equal((await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='reward.send_error'")).n, 1, name + ': bounded audit');
+    f.override = null;
+    assert.equal((await retryQueued(w.ctx, w.company)).sent, 1, name);
+    assert.equal((await retryQueued(w.ctx, w.company)).sent, 0);
+    assert.equal((await mnp(f).getBalance({ accountRef: 'a@acme.test' })).balance, 40, name + ': paid once');
+  }
+});
+
+test('R10-4: a permanent 400 fails an event reward visibly; the admin revive pays it once, with the same key', async () => {
+  const f = fakeMoneypenny();
+  const w = await world({ providerOverride: () => mnp(f), settings: { daily_event_limit: 1000 } });
+  await w.db.run("UPDATE company SET provider = 'moneypenny'"); await w.reload(); await exampleCard(w);
+  f.override = answer(422, 'mystery');
+  const r = await submitEvent(w.ctx, w.company, SYSTEM, { person_id: w.people.a.id, event_type: 'game', stage: 'completed', ext_id: 'perm', source: 'api', occurred_at: w.clock.t });
+  assert.ok(r.ok);
+  const row = await w.db.first('SELECT id, state, last_error, idem_key FROM reward WHERE person_id = ?', w.people.a.id);
+  assert.equal(row.state, 'failed'); assert.equal(row.last_error, 'bad_request');
+  assert.equal(await openFailedRewards(w.ctx, w.company.id), 1);
+  assert.equal((await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='reward.failed'")).n, 1);
+  f.override = null;
+  const out = await reviveFailedRewards(w.ctx, w.company);
+  assert.equal(out.revived, 1);
+  const after = await w.db.first('SELECT state, idem_key FROM reward WHERE id = ?', row.id);
+  assert.equal(after.state, 'sent'); assert.equal(after.idem_key, row.idem_key, 'same key: cannot pay twice');
+  assert.equal(await openFailedRewards(w.ctx, w.company.id), 0);
+  assert.equal((await reviveFailedRewards(w.ctx, w.company)).revived, 0);
+  assert.equal((await mnp(f).getBalance({ accountRef: 'a@acme.test' })).balance, 40);
 });

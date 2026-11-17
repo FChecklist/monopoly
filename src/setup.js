@@ -112,7 +112,8 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
   if (s.hold_id && (await prov.capabilities()).hold) {
     // The new budget is held in full (less what was already paid out); the old hold's remainder goes back.
     const st = settingsOf(company);
-    const used = (await ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state IN ('queued','sent')", company.id, s.id)).n;
+    // Only SENT rows have drawn from the hold. A queued row has not (it draws when it is sent), so it stays inside the new hold or it would draw twice.
+    const used = (await ctx.db.first("SELECT COALESCE(SUM(sent_amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state='sent'", company.id, s.id)).n;
     const top = s.mode === 'dice' ? Math.ceil(budget * (1 + st.bonus_max_pct / 100)) : budget;
     const h = await prov.reserveBudget({ amount: Math.max(0, top - used), name: s.name, idem: `hold:${s.id}:${budget}` });
     await prov.releaseHold({ holdId: s.hold_id });

@@ -4,7 +4,7 @@ import { settingsOf } from './config.js';
 import { commit } from './audit.js';
 import { ApiError, newId, DAY, clean, monthKey } from './util.js';
 import { ensureBoard, enterLane, checkReset, finishLaneTask } from './board.js';
-import { accountRef, grant, earnedNet } from './rewards.js';
+import { accountRef, grant, earnedNet, sendReward, isTransient } from './rewards.js';
 import { ProviderError } from './provider/errors.js';
 
 export const NOTICE_DAYS = 3, APPEAL_DAYS = 7, L1_DAYS = 3, L2_DAYS = 3, L3_DAYS = 5; // 3 + 3 + 5 = 11 days in all
@@ -175,16 +175,31 @@ export async function restoreDebit(ctx, company, caseId, credits, gen) {
   const key = 'penrestore:' + caseId + (gen ? ':g' + gen : '');
   try {
     if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n > 0) return; // this restore is already recorded
+    // The pending marker goes in BEFORE the credit (once per key): if the credit lands and our receipt then fails for any reason, the tick finishes it with the same key.
+    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore_pending' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n === 0) await commit(ctx, company.id, 'system', 'penalty.restore_pending', { id: caseId, credits, key });
     const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', now.person_id);
     await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: credits, reasonCode: 'penalty_restore', ref: caseId, idem: key });
     await commit(ctx, company.id, 'system', 'penalty.restore', { id: caseId, credits, key }); // the debit is over: a later debit of this case is a NEW debit (new key)
   } catch (e) {
     if (!(e instanceof ProviderError)) throw e;
-    // The debit exists at the provider but its hand-back did not land: write that down, so the tick finishes it (same key, so once only).
-    try { await commit(ctx, company.id, 'system', 'penalty.restore_pending', { id: caseId, credits, key, code: e.code }); } catch { /* the next try writes it again */ }
+    // The pending marker already exists. A PERMANENT error is counted (penalty.restore_failed) so the tick stops after MAX_RESTORE_TRIES; a transient one is not logged at all.
+    if (!e.retriable && !isTransient(e.code)) { try { await commit(ctx, company.id, 'system', 'penalty.restore_failed', { id: caseId, key, code: e.code }); } catch { /* the next try counts again */ } }
   }
 }
 
+const MAX_RESTORE_TRIES = 5;
+const restoreTries = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore_failed' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n;
+/** Restores that gave up after MAX_RESTORE_TRIES permanent provider errors (admin overview: open_restores_failed). */
+export async function openRestoresFailed(ctx, companyId) {
+  const tries = new Map(), done = new Set();
+  for (const r of await ctx.db.all("SELECT action, data FROM audit WHERE company_id = ? AND action IN ('penalty.restore_failed','penalty.restore','penalty.restore_skipped')", companyId)) {
+    let d; try { d = JSON.parse(r.data); } catch { continue; }
+    if (!d?.key) continue;
+    if (r.action === 'penalty.restore_failed') tries.set(d.key, (tries.get(d.key) ?? 0) + 1); else done.add(d.key);
+  }
+  let n = 0; for (const [k, t] of tries) if (t >= MAX_RESTORE_TRIES && !done.has(k)) n++;
+  return n;
+}
 /** Finish restores that were cut short (provider down while a lost-race debit was being handed back). Idempotent: same key as the first try. */
 async function finishRestores(ctx, company) {
   let done = 0;
@@ -193,6 +208,7 @@ async function finishRestores(ctx, company) {
   for (const r of rows) {
     let d; try { d = JSON.parse(r.data); } catch { continue; }
     if (!d?.key || seen.has(d.key)) continue; seen.add(d.key);
+    if ((await restoreTries(ctx, company, d.key)) >= MAX_RESTORE_TRIES) continue; // gave up: shown as open_restores_failed
     if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action IN ('penalty.restore','penalty.restore_skipped') AND instr(data, ?) > 0", company.id, `"key":"${d.key}"`)).n > 0) continue;
     const c = await ctx.db.first('SELECT state, applied_credits FROM penalty_case WHERE id = ?', d.id);
     if (!c || c.applied_credits > 0) { await commit(ctx, company.id, 'system', 'penalty.restore_skipped', { id: d.id, key: d.key }); continue; } // the winner recorded this debit: nothing to restore
@@ -257,6 +273,10 @@ export async function tickPenalties(ctx, company) {
   try { out.repaired += await finishRestores(ctx, company); } catch { out.errors++; }
   for (const c of await ctx.db.all("SELECT * FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE " + PENREV_ROWS + " AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE " + PENREV_ROWS + " AND r.state = 'failed') < " + MAX_HANDBACK_TRIES, company.id)) {
     try { if (await handBack(ctx, company, c, 'system')) out.repaired++; } catch (e) { out.errors++; }
+  }
+  // The hand-back credit is a queued penalty_return reward during an outage: this tick sends it itself, it does not rely on the rest of the tick.
+  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id = ? AND state = 'queued' AND kind = 'penalty_return'", company.id)) {
+    try { if ((await sendReward(ctx, company, r)).state === 'sent') out.repaired++; } catch { out.errors++; }
   }
   for (const c of await ctx.db.all("SELECT * FROM penalty_case WHERE company_id = ? AND (state IN ('pending','appealed') OR (state = 'upheld' AND applied_at IS NULL))", company.id)) {
     try {

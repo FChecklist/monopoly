@@ -5,10 +5,34 @@
 import { ProviderError, NO_CAPS } from './errors.js';
 import { hmacHex, sha256Hex, newId } from '../util.js';
 
+// Known body codes of API.md. A known code always wins over the status. Codes that are about ONE account or ONE request are permanent for it.
 const MAP_CODES = {
   insufficient_credits: 'insufficient_credits', cap_reached: 'cap_reached', daily_cap_reached: 'cap_reached', limit_reached: 'cap_reached',
-  account_frozen: 'account_closed', frozen: 'account_closed', rate_limited: 'rate_limited', conversion_off: 'unsupported',
+  account_frozen: 'account_closed', frozen: 'account_closed', no_account: 'account_closed', rate_limited: 'rate_limited', conversion_off: 'unsupported',
+  bad_email: 'bad_request', below_minimum: 'bad_request', cap_required: 'bad_request', more_than_convertible: 'bad_request', bad_json: 'bad_request', idempotency_conflict: 'bad_request',
+  idempotency_key_required: 'misconfigured', wrong_key_type: 'unauthorized', unsigned: 'unauthorized', bad_signature: 'unauthorized', stale_timestamp: 'unauthorized', replayed: 'unauthorized',
 };
+
+/**
+ * Status -> code for an error answer (API.md). The point: a CONFIGURATION or CLOCK fault (revoked/rotated key, clock drift, replayed nonce, wrong URL)
+ * must never be read as "this person's credit is refused for good", because that would fail every queued reward.
+ *   401, 403, 408, 425            -> unauthorized  (retriable)
+ *   404, 409 (unknown body code)  -> misconfigured (retriable)
+ *   429, 5xx, network             -> retriable
+ *   400, 422 (unknown body code)  -> bad_request   (permanent: this request is wrong)
+ *   402 (unknown body code)       -> insufficient_credits: on /v1/credit this can only be the tenant side being out of funds, so the game WAITS (never fails)
+ * A permanent code ends a reward only when Moneypenny gave it for THIS call, and API.md says a failed call leaves no trace, so a retry with the same key is safe.
+ */
+export function mapStatus(status, bodyCode) {
+  if (status >= 500) return 'provider_down';
+  if (status === 429) return 'rate_limited';
+  if (bodyCode && MAP_CODES[bodyCode]) return MAP_CODES[bodyCode];
+  if ([401, 403, 408, 425].includes(status)) return 'unauthorized';
+  if (status === 404 || status === 409) return 'misconfigured';
+  if (status === 402) return 'insufficient_credits';
+  if ([400, 413, 414, 415, 422, 431].includes(status)) return 'bad_request';
+  return 'misconfigured'; // 3xx, 405, 410 and anything unexpected: our setup, not the person
+}
 
 export class MoneypennyProvider {
   /** cfg: { baseUrl, keyId, secret, product? }. fetchImpl and clock can be replaced in tests. */
@@ -25,20 +49,29 @@ export class MoneypennyProvider {
     const raw = body === undefined ? '' : JSON.stringify(body);
     const ts = String(this.now());
     const nonce = newId('n');
-    const sig = await hmacHex(this.cfg.secret, [ts, nonce, method, path, await sha256Hex(raw)].join('\n'));
+    const idemKey = method === 'GET' ? '' : String(idem ?? nonce).slice(0, 120);
+    // API.md: the signature covers the idempotency key too (empty on a GET).
+    const sig = await hmacHex(this.cfg.secret, [ts, nonce, method, path, await sha256Hex(raw), idemKey].join('\n'));
     const headers = { 'x-mnp-key': this.cfg.keyId, 'x-mnp-timestamp': ts, 'x-mnp-nonce': nonce, 'x-mnp-signature': sig, 'content-type': 'application/json' };
-    if (method !== 'GET') headers['idempotency-key'] = String(idem ?? nonce).slice(0, 120);
+    if (method !== 'GET') headers['idempotency-key'] = idemKey;
     let res;
-    try { res = await this.fetch(this.cfg.baseUrl.replace(/\/$/, '') + path, { method, headers, body: raw || undefined }); }
-    catch { throw new ProviderError('provider_down', 'Moneypenny could not be reached.', { retriable: true }); }
+    try {
+      const init = { method, headers, body: raw || undefined };
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) init.signal = AbortSignal.timeout(this.cfg.timeoutMs ?? 15000);
+      res = await this.fetch(this.cfg.baseUrl.replace(/\/$/, '') + path, init);
+    } catch (e) {
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') throw new ProviderError('timeout', 'Moneypenny did not answer in time.', { retriable: true });
+      throw new ProviderError('provider_down', 'Moneypenny could not be reached.', { retriable: true });
+    }
     let j = null;
     try { j = await res.json(); } catch { /* not json */ }
-    if (res.status >= 500) throw new ProviderError('provider_down', 'Moneypenny is down.', { retriable: true });
-    if (res.status === 429) throw new ProviderError('rate_limited', 'Slow down.', { retriable: true });
     if (!res.ok || j?.ok === false) {
-      const code = j?.error?.code ?? 'bad_request';
-      throw new ProviderError(MAP_CODES[code] ?? (res.status === 402 ? 'insufficient_credits' : 'bad_request'), j?.error?.message ?? code);
+      const body = j?.error?.code;
+      const code = mapStatus(res.status, typeof body === 'string' ? body : undefined);
+      throw new ProviderError(code, j?.error?.message ?? body ?? ('http_' + res.status));
     }
+    // A 200 whose body is not the JSON object API.md promises (a proxy page, a cut answer) is a provider fault, never a person's problem: retry.
+    if (!j || typeof j !== 'object') throw new ProviderError('bad_response', 'Moneypenny sent an answer that is not JSON.', { retriable: true });
     return { json: j, replay: res.headers?.get?.('idempotent-replay') === 'true' };
   }
 
