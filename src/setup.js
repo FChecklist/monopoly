@@ -2,7 +2,7 @@
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
-import { accountRef, retryQueued } from './rewards.js';
+import { accountRef, retryQueued, releaseSeasonHold } from './rewards.js';
 import { ProviderError } from './provider/errors.js';
 
 const must = (actor, ...roles) => { if (!roles.includes(actor.role)) throw new ApiError(403, 'not_allowed', 'You cannot do this.'); };
@@ -116,10 +116,11 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
     const used = (await ctx.db.first("SELECT COALESCE(SUM(sent_amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state='sent'", company.id, s.id)).n;
     const top = s.mode === 'dice' ? Math.ceil(budget * (1 + st.bonus_max_pct / 100)) : budget;
     const h = await prov.reserveBudget({ amount: Math.max(0, top - used), name: s.name, idem: `hold:${s.id}:${budget}` });
-    await prov.releaseHold({ holdId: s.hold_id });
     holdId = h.hold_id;
   }
+  // The new hold is recorded FIRST; only then the old one goes back. A failed commit can never leave the season on a released hold.
   await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId }, [['UPDATE season SET budget = ?, hold_id = ? WHERE id = ?', budget, holdId, s.id]]);
+  if (holdId !== s.hold_id && s.hold_id) { try { await prov.releaseHold({ holdId: s.hold_id }); } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
 }
 export async function closeSeason(ctx, company, actor, seasonId) {
   must(actor, 'admin');
@@ -130,9 +131,12 @@ export async function closeSeason(ctx, company, actor, seasonId) {
   // Rewards of this season that are queued (a provider outage kept them) still draw from its hold. Try them once; if any is still on its way
   // the hold stays until the tick has sent them (releaseClosedHolds), so closing a season never turns earned rewards into voids.
   try { await retryQueued(ctx, company, 1000); } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  let needRelease = false;
   if ((await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE season_id=? AND state='queued'", s.id)).n > 0) deferred = true;
-  else if (s.hold_id && (await prov.capabilities()).hold) released = (await prov.releaseHold({ holdId: s.hold_id })).released; // unused budget goes back to the company
-  await commit(ctx, company.id, actor.id, 'season.close', deferred ? { id: s.id, released, deferred: true } : { id: s.id, released }, [["UPDATE season SET status='closed' WHERE id=?", s.id]]);
+  else if (s.hold_id && (await prov.capabilities()).hold) needRelease = true;
+  // The close is recorded FIRST (deferred while a hold still has to go back); the hold is released after, so a failed commit cannot leave a published season on a released hold.
+  await commit(ctx, company.id, actor.id, 'season.close', deferred || needRelease ? { id: s.id, released, deferred: true } : { id: s.id, released }, [["UPDATE season SET status='closed' WHERE id=?", s.id]]);
+  if (needRelease) { const amt = await releaseSeasonHold(ctx, company, s); if (amt === null) deferred = true; else released = amt; } // unused budget goes back to the company
   return deferred ? { released, hold_pending: true } : { released };
 }
 

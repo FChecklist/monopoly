@@ -144,6 +144,7 @@ export async function grant(ctx, company, p) {
 // insufficient_credits on a CREDIT call can only mean the tenant side is out of funds (API.md has no person-level 402 on /v1/credit): it waits, it never fails the row.
 export const TRANSIENT = new Set([...RETRIABLE_CODES, 'unsupported', 'insufficient_credits']);
 export const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
+// NOTE: 'cap_reached' (a Moneypenny rule cap) is deliberately PERMANENT for the row (it fails visibly, open_failed_rewards, and an admin can revive it after raising the cap).
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
 export async function sendReward(ctx, company, r) {
   if (r.state !== 'queued') return r;
@@ -159,7 +160,10 @@ export async function sendReward(ctx, company, r) {
   const marked = await ctx.db.run("UPDATE reward SET attempts = attempts + 1 WHERE id = ? AND state = 'queued'", r.id);
   if (marked.changes === 0) return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
   try {
-    const prov = ctx.provider(company);
+    let prov;
+    try { prov = ctx.provider(company); } catch (e) { // whatever the provider setup says (missing key, bad URL, unknown provider) is OUR configuration: the row waits, it never fails
+      throw e instanceof ProviderError && !(e.retriable || isTransient(e.code)) ? new ProviderError('misconfigured', e.message) : e;
+    }
     const ref = await accountRef(ctx, company, person);
     const caps = await prov.capabilities();
     const res = await prov.credit({ accountRef: ref, amount: r.sent_amount, fromHoldId: caps.hold ? season?.hold_id : undefined, expiresAt: null, reasonCode: r.kind, ref: r.id, idem: r.idem_key });
@@ -204,7 +208,7 @@ async function failReward(ctx, company, r, code) {
   await commit(ctx, company.id, 'system', 'reward.failed', { id: r.id, code }, stmts);
 }
 
-const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1)"; // period rows with one try revive themselves under a new key (x<n>) after the block time
+const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1) AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))"; // a reward of an event that was reversed is never revived // period rows with one try revive themselves under a new key (x<n>) after the block time
 const MAX_REVIVES = 5;
 /** Failed event rewards (and period rows tried more than once) that wait for an admin. Shown as open_failed_rewards in the overview. */
 export const openFailedRewards = async (ctx, companyId) => (await ctx.db.first('SELECT COUNT(*) n FROM reward WHERE ' + REVIVABLE, companyId)).n;
@@ -226,11 +230,34 @@ export async function reviveFailedRewards(ctx, company, actor = 'admin') {
   return { revived, ...rel };
 }
 
+/** A failed event reward whose event is being reversed: nothing was ever sent for it (failed = definitive rejection), so it is voided, not revived later. */
+export async function voidFailedReward(ctx, company, r, reason = 'event_reversed') {
+  await commit(ctx, company.id, 'system', 'reward.void', { orig: r.id, reason }, [["UPDATE reward SET state='void', reversed=1, last_error=? WHERE id=? AND state='failed'", reason, r.id]], { onlyIfChanged: true });
+}
+
+/** A reverse call is about to go out: leave a marker FIRST (once per row), so a lost answer is finished before the row is trusted as paid. */
+async function markReversePending(ctx, company, r, reason, eventId) {
+  if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0", company.id, `"id":"${r.id}"`)) return;
+  await commit(ctx, company.id, 'system', 'reward.reverse_pending', { id: r.id, reason: String(reason ?? 'reversal').slice(0, 80), event: eventId ?? null });
+}
+/** Re-run the idempotent reverse (key rev:<entry>) of rows of this group whose reverse call may have been cut short, before anybody counts them as paid. */
+export async function healPendingReverses(ctx, company, personId, groupKey) {
+  let healed = 0;
+  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='sent' AND reversed=0 AND amount>0 AND kind != 'reversal'", company.id, personId, groupKey)) {
+    const m = await ctx.db.first("SELECT data FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"id":"${r.id}"`);
+    if (!m) continue;
+    let d = {}; try { d = JSON.parse(m.data); } catch { /* default reason */ }
+    const o = await reverseReward(ctx, company, r, { reason: d.reason ?? 'reversal', actor: 'system', eventId: d.event ?? null });
+    if (!o.skipped) healed += r.amount;
+  }
+  return healed;
+}
+
 /** Retry everything that is "on its way". Run by the admin button and by the scheduled trigger. */
 export async function retryQueued(ctx, company, limit = 100) {
   let sent = 0, stuck = 0;
   limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 100));
-  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND state='queued' ORDER BY created_at LIMIT ?", company.id, limit)) {
+  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND state='queued' ORDER BY attempts, created_at LIMIT ?", company.id, limit)) { // fewest tries first: a row that can never be sent cannot starve newer ones
     const out = await sendReward(ctx, company, r);
     if (out.state === 'sent') sent++;
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
@@ -243,17 +270,22 @@ export async function retryQueued(ctx, company, limit = 100) {
  * A season closed while some of its rewards were still queued (provider outage) keeps its budget hold, because those rewards draw from it.
  * Once none is queued any more the hold is released and forgotten. Idempotent; a provider problem just leaves it for the next tick.
  */
+/** Give a closed season's hold back and write the line. Returns the amount, or null while the provider cannot do it (the tick tries again). */
+export async function releaseSeasonHold(ctx, company, se) {
+  let amount = 0;
+  try {
+    const prov = ctx.provider(company);
+    if ((await prov.capabilities()).hold) amount = (await prov.releaseHold({ holdId: se.hold_id })).released ?? 0;
+  } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') return null; }
+  await commit(ctx, company.id, 'system', 'season.hold_released', { id: se.id });
+  return amount;
+}
 export async function releaseClosedHolds(ctx, company) {
   let released = 0;
   const pending = await ctx.db.all("SELECT s.* FROM season s WHERE s.company_id=? AND s.status='closed' AND s.hold_id IS NOT NULL AND EXISTS (SELECT 1 FROM audit a WHERE a.company_id=s.company_id AND a.action='season.close' AND instr(a.data, '\"deferred\":true') > 0 AND instr(a.data, '\"id\":\"' || s.id || '\"') > 0) AND NOT EXISTS (SELECT 1 FROM audit a WHERE a.company_id=s.company_id AND a.action='season.hold_released' AND instr(a.data, '\"id\":\"' || s.id || '\"') > 0)", company.id);
   for (const se of pending) {
     if ((await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE season_id=? AND state='queued'", se.id)).n > 0) continue;
-    try {
-      const prov = ctx.provider(company);
-      if ((await prov.capabilities()).hold) await prov.releaseHold({ holdId: se.hold_id });
-    } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') continue; }
-    await commit(ctx, company.id, 'system', 'season.hold_released', { id: se.id });
-    released++;
+    if ((await releaseSeasonHold(ctx, company, se)) !== null) released++;
   }
   return released;
 }
@@ -272,7 +304,7 @@ export async function releaseWaiting(ctx, company) {
     const at = n.at ?? r.created_at;
     const own = r.season_id ? await ctx.db.first('SELECT * FROM season WHERE id=?', r.season_id) : null;
     const season = own ? (own.status === 'published' ? own : null) : r.season_id ? null : await seasonAt(ctx, company.id, at);
-    const neverSent = r.attempts === 0 || r.last_error === 'insufficient_budget' || r.last_error === 'hold_expired';
+    const neverSent = r.attempts === 0 || r.last_error === 'insufficient_budget' || r.last_error === 'hold_expired' || r.last_error === 'revived'; // a revived row failed for good first: nothing was ever sent for it
     if (!season) {
       // A row whose season is closed, or that no published season covers, can never be released. After the late-event
       // window it is voided with a plain reason instead of sitting here forever (nothing was ever sent for it).
@@ -360,6 +392,7 @@ export async function reverseReward(ctx, company, r, { reason, actor = 'system',
     try { prov = ctx.provider(company); canReverse = (await prov.capabilities()).reverse; } catch (e) { if (!(e instanceof ProviderError)) throw e; return { reversed: 0, owed: 0, skipped: true, pending: true, code: e.code }; }
     if (canReverse) {
       try {
+        await markReversePending(ctx, company, r, reason, eventId);
         const out = await prov.reverse({ entryId: r.provider_ref, reasonCode: 'reversal', idem: 'rev:' + r.provider_ref });
         reversed = out.reversed; owed = out.owed ?? Math.max(0, (r.sent_amount ?? r.amount) - reversed);
       } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.retriable) throw e; }

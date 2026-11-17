@@ -2,7 +2,7 @@
 import { settingsOf } from './config.js';
 import { commit } from './audit.js';
 import { ApiError, newId, normEmail, DAY, clean, defuse } from './util.js';
-import { grant, reverseReward, seasonAt, capOf } from './rewards.js';
+import { grant, reverseReward, seasonAt, capOf, voidFailedReward } from './rewards.js';
 import { moveToken, die, bonusPct } from './board.js';
 import { proposePenalty } from './penalty.js';
 
@@ -290,6 +290,7 @@ async function executeReversal(ctx, company, eventId, actorId, { upheld = false 
   const total = { reversed: 0, owed: 0 };
   let pending = 0;
   for (const r of rows) {
+    if (r.state === 'failed') { await voidFailedReward(ctx, company, r); continue; } // never sent: voided, so a later admin revive cannot pay a reversed event
     const o = await reverseReward(ctx, company, r, { reason: ev.reversal_reason ?? 'cancelled', actor: actorId, eventId });
     total.reversed += o.reversed; total.owed += o.owed;
     if (o.pending) pending++; // the provider has not confirmed this credit yet: it may still go out, so it is not resolved

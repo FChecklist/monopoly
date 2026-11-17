@@ -37,8 +37,8 @@ export function mapStatus(status, bodyCode) {
 export class MoneypennyProvider {
   /** cfg: { baseUrl, keyId, secret, product? }. fetchImpl and clock can be replaced in tests. */
   constructor(cfg, { fetchImpl = globalThis.fetch, now = () => Date.now() } = {}) {
-    if (!cfg?.baseUrl || !cfg.keyId || !cfg.secret) throw new ProviderError('bad_request', 'Moneypenny settings are incomplete.');
-    if (!/^https:\/\//.test(cfg.baseUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(cfg.baseUrl)) throw new ProviderError('bad_request', 'Moneypenny must be reached over https.');
+    if (!cfg?.baseUrl || !cfg.keyId || !cfg.secret) throw new ProviderError('misconfigured', 'Moneypenny settings are incomplete.'); // a setup fault, never a reason to fail a reward for good
+    if (!/^https:\/\//.test(cfg.baseUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(cfg.baseUrl)) throw new ProviderError('misconfigured', 'Moneypenny must be reached over https.');
     this.cfg = cfg; this.fetch = fetchImpl; this.now = now; this.name = 'moneypenny';
   }
   async capabilities() { return { ...NO_CAPS, spend: true }; }
@@ -71,7 +71,7 @@ export class MoneypennyProvider {
       throw new ProviderError(code, j?.error?.message ?? body ?? ('http_' + res.status));
     }
     // A 200 whose body is not the JSON object API.md promises (a proxy page, a cut answer) is a provider fault, never a person's problem: retry.
-    if (!j || typeof j !== 'object') throw new ProviderError('bad_response', 'Moneypenny sent an answer that is not JSON.', { retriable: true });
+    if (!j || typeof j !== 'object' || j.ok !== true) throw new ProviderError('bad_response', 'Moneypenny sent an answer that is not JSON.', { retriable: true });
     return { json: j, replay: res.headers?.get?.('idempotent-replay') === 'true' };
   }
 
@@ -82,6 +82,7 @@ export class MoneypennyProvider {
   async credit({ accountRef, amount, reasonCode, ref, idem }) {
     if (!Number.isInteger(amount) || amount <= 0) throw new ProviderError('bad_request', 'amount');
     const { json, replay } = await this.#call('POST', '/v1/credit', { email: accountRef, bucket: 'bonus', amount, ref: String(ref ?? idem).slice(0, 120) }, idem);
+    if (typeof json.granted !== 'number' && json.granted !== false) throw new ProviderError('bad_response', 'Moneypenny did not say what it granted.', { retriable: true });
     if (json.granted === false || json.granted === 0) throw new ProviderError('cap_reached', 'Moneypenny did not grant the credit.');
     // A partial grant is reported as partial, never recorded as the full amount.
     const granted = Number.isInteger(json.granted) && json.granted > 0 && json.granted < amount ? json.granted : amount;

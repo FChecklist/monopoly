@@ -2,7 +2,7 @@
 // All bonuses are settled as an "entitlement": what the person has earned now minus what was already paid.
 // A positive difference is paid once (idempotent). A negative one is reversed. So a later cancellation is corrected at the next close.
 import { settingsOf } from './config.js';
-import { grant, reverseReward, seasonAt } from './rewards.js';
+import { grant, reverseReward, seasonAt, healPendingReverses } from './rewards.js';
 import { periodOf, prevPeriod, DAY, sha256Hex } from './util.js';
 import { commit } from './audit.js';
 import { ProviderError } from './provider/errors.js';
@@ -44,8 +44,9 @@ const paidSum = async (ctx, companyId, personId, groupKey) =>
 
 /** Bring what was paid for (person, group) in line with what is earned now. */
 export async function settleEntitlement(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label }) {
+  const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
   let paid = await paidSum(ctx, company.id, person.id, groupKey);
-  const out = { paid: 0, reversed: 0 };
+  const out = { paid: 0, reversed: healed };
   if (entitled < paid) {
     // Reverse newest rows first until paid <= entitled. Any overshoot is topped up below.
     const rows = await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=0 AND amount>0 AND kind != 'reversal' AND state IN ('queued','sent','waiting') ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);

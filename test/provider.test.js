@@ -204,3 +204,10 @@ test('R10-4: a permanent 400 fails an event reward visibly; the admin revive pay
   assert.equal((await reviveFailedRewards(w.ctx, w.company)).revived, 0);
   assert.equal((await mnp(f).getBalance({ accountRef: 'a@acme.test' })).balance, 40);
 });
+
+test('R5: a 200 that is not {"ok":true,...} with a number "granted" is never counted as a sent credit', async () => {
+  for (const body of [{}, [], { ok: true }, { ok: true, granted: 'x' }, { ok: false }]) {
+    const e = await codeOf(fakeMoneypenny(), (path, init, reply) => (path === '/v1/credit' ? reply(200, body) : null));
+    assert.ok(e instanceof ProviderError, JSON.stringify(body)); assert.equal(e.retriable, true);
+  }
+});

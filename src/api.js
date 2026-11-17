@@ -403,6 +403,7 @@ route('POST', '/api/admin/buy', async (c) => {
   catch (e) { if (e instanceof ProviderError) throw new ApiError(409, e.code, e.message); throw e; }
 });
 route('POST', '/api/admin/settle', async (c) => { adm(c); return settleCompany(c.ctx, c.company, c.ctx.now(), { force: c.body.force === true }); });
+route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin'); });
 route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });
 route('GET', '/api/admin/audit', async (c) => {
@@ -415,7 +416,7 @@ route('GET', '/api/admin/overview', async (c) => {
   need(c.user, 'admin', 'hr');
   const q = (sql, ...p) => c.ctx.db.first(sql, ...p).then((r) => r.n);
   const cid = c.company.id;
-  return {
+  const o = {
     people: await q("SELECT COUNT(*) n FROM app_user WHERE company_id = ? AND status = 'active'", cid),
     events_pending: await q("SELECT COUNT(*) n FROM event WHERE company_id = ? AND status IN ('pending','held')", cid),
     rewards_on_the_way: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued'", cid),
@@ -425,11 +426,16 @@ route('GET', '/api/admin/overview', async (c) => {
     open_handbacks_failed: await q("SELECT COUNT(*) n FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state = 'failed') >= 5", cid),
     open_failed_rewards: await R.openFailedRewards(c.ctx, cid),
     open_restores_failed: await Pen.openRestoresFailed(c.ctx, cid),
+    rewards_stuck: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
     rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
     season: await c.ctx.db.first("SELECT id, name, budget, ends_at FROM season WHERE company_id = ? AND status = 'published' ORDER BY starts_at DESC LIMIT 1", cid),
     used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
   };
+  // One plain line per thing that needs an admin: no code, no names.
+  const say = { open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
+  o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
+  return o;
 });
 route('GET', '/api/admin/rights', async (c) => { need(c.user, 'admin', 'hr'); return { requests: await c.ctx.db.all('SELECT id, person_id, kind, note, state, created_at FROM rights_request WHERE company_id = ? ORDER BY created_at DESC', c.company.id) }; });
 
