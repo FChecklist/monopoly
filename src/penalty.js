@@ -115,6 +115,7 @@ async function applyPenalty(ctx, company, c0) {
   const s = settingsOf(company);
   const c = await ctx.db.first(`SELECT * FROM penalty_case WHERE id = ? AND company_id = ? AND ${OPEN_SQL}`, c0.id, company.id);
   if (!c) return null;
+  const gen = await restoresOf(ctx, company, c.id); // ONCE per apply: the debit key and any restore of it share this generation
   const b = await ensureBoard(ctx, company, c.person_id);
   const upd = { steps: 0, points: 0, credits: 0, prev: b.position };
   const stmts = [];
@@ -140,7 +141,7 @@ async function applyPenalty(ctx, company, c0) {
       const ask = Math.min(c.amount, room);
       if (ask > 0) {
         try {
-          const out = await prov.debit({ accountRef: await accountRef(ctx, company, person), amount: ask, reasonCode: 'penalty', ref: c.id, idem: await debitIdem(ctx, company, c.id), monthlyCap: room });
+          const out = await prov.debit({ accountRef: await accountRef(ctx, company, person), amount: ask, reasonCode: 'penalty', ref: c.id, idem: debitIdem(c.id, gen), monthlyCap: room });
           upd.credits = out.debited; // may be less than asked, never below zero, never spent credits
         } catch (e) { if (e instanceof ProviderError && e.retriable) return null; if (!(e instanceof ProviderError)) throw e; }
       }
@@ -149,7 +150,7 @@ async function applyPenalty(ctx, company, c0) {
   stmts.push([`UPDATE penalty_case SET ${c.state === 'upheld' ? '' : "state='applied', "}applied_at=?, applied_steps=?, applied_points=?, applied_credits=?, prev_pos=? WHERE id=? AND ${OPEN_SQL}`, ctx.now(), upd.steps, upd.points, upd.credits, upd.prev, c.id]);
   const res = await commit(ctx, company.id, 'system', 'penalty.apply', { id: c.id, ...upd }, stmts, { onlyIfChanged: true });
   if (res[stmts.length - 1].changes === 0) { // somebody else applied or reversed it first
-    await restoreDebit(ctx, company, c.id, upd.credits);
+    await restoreDebit(ctx, company, c.id, upd.credits, gen);
     return null;
   }
   if (c.effect === 'points') await checkReset(ctx, company, c.person_id);
@@ -162,19 +163,21 @@ async function applyPenalty(ctx, company, c0) {
  */
 /** How many times the debit of this case was handed back (restoreDebit). Each hand-back ends a debit for good, so the next debit needs a new key. */
 const restoresOf = async (ctx, company, caseId) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"id":"${caseId}"`)).n;
-const debitIdem = async (ctx, company, caseId) => { const g = await restoresOf(ctx, company, caseId); return g ? `pen:${caseId}:g${g}` : 'pen:' + caseId; };
+const debitIdem = (caseId, g) => { return g ? `pen:${caseId}:g${g}` : 'pen:' + caseId; };
 
-export async function restoreDebit(ctx, company, caseId, credits) {
+export async function restoreDebit(ctx, company, caseId, credits, gen) {
   if (!(credits > 0)) return;
   const now = await ctx.db.first('SELECT state, applied_credits, person_id FROM penalty_case WHERE id = ?', caseId);
   if (!now) return;
   if (['applied', 'appealed', 'upheld'].includes(now.state) && now.applied_credits > 0) return;
   if (now.state === 'reversed' && now.applied_credits > 0) return; // the winner recorded this debit; the penrev: hand-back owns it
   try {
-    const gen = await restoresOf(ctx, company, caseId);
+    if (gen === undefined) gen = await restoresOf(ctx, company, caseId); // direct callers only; applyPenalty passes the generation it debited with
+    const key = 'penrestore:' + caseId + (gen ? ':g' + gen : '');
+    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n > 0) return; // this restore is already recorded
     const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', now.person_id);
-    await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: credits, reasonCode: 'penalty_restore', ref: caseId, idem: 'penrestore:' + caseId + (gen ? ':g' + gen : '') });
-    await commit(ctx, company.id, 'system', 'penalty.restore', { id: caseId, credits }); // the debit is over: a later debit of this case is a NEW debit (new key)
+    await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: credits, reasonCode: 'penalty_restore', ref: caseId, idem: key });
+    await commit(ctx, company.id, 'system', 'penalty.restore', { id: caseId, credits, key }); // the debit is over: a later debit of this case is a NEW debit (new key)
   } catch (e) { if (!(e instanceof ProviderError)) throw e; }
 }
 

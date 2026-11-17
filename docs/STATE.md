@@ -41,3 +41,4 @@ Scans clean: scripts/scan-words.js, scripts/scan-secrets.js.
 1. Read round-3 audit verdicts; fix any FAIL; repeat until two PASSes in a row.
 2. Update this file with the verdicts; tell BOSS and the Hub builder.
 3. On BOSS's release of the deploy hold and the owner's repo confirmation: follow docs/DEPLOY.md.
+- Round 8 (M1): applyPenalty fixes the debit/restore generation once per apply; restoreDebit takes it and skips an already-recorded restore key.
