@@ -224,7 +224,7 @@ async function run({ seed, variant, days = 100 }) {
 const seeds = (process.argv[2] ?? '1,2,3').split(',').map(Number); const variants = (process.argv[3] ?? 'full').split(',');
 let bad = 0;
 for (const variant of variants) for (const seed of seeds) {
-  try { const r = await run({ seed, variant }); if (r.viol.length) bad++; console.log(JSON.stringify({ seed, variant, viol: r.viol.length, log: r.log, stuck: r.stuck, evstuck: r.evstuck, auditGrowth: r.auditGrowth, rewards: r.rewards, corr: r.corr })); for (const v of [...new Set(r.viol.map((x) => x.replace(/day \d+/, 'day N').replace(/rw_\w+|cr_\w+|[a-z]{1,3}_[0-9a-f]{6,}/g, 'ID')))].slice(0, 8)) console.log('  ', v); if (r.viol[0]) console.log('   first:', r.viol[0]); }
+  try { const r = await run({ seed, variant }); if (r.viol.length) bad++; console.log(JSON.stringify({ seed, variant, viol: r.viol.length, log: r.log, stuck: r.stuck, evstuck: r.evstuck, auditGrowth: r.auditGrowth, rewards: r.rewards, corr: r.corr })); for (const v of [...new Set(r.viol.map((x) => x.replace(/day \d+/, 'day N').replace(/rw_\w+|cr_\w+|[a-z]{1,3}_[0-9a-f]{6,}/g, 'ID')))].slice(0, 8)) console.log('  ', v); for (const v of r.viol.slice(0, 4)) for (let i = 0; i < v.length; i += 70) console.log('VIOL', v.slice(i, i + 70)); }
   catch (e) { bad++; console.log('CRASH', seed, variant, e.stack.split('\n').slice(0, 4).join(' | ')); }
 }
 process.exit(bad ? 1 : 0);
