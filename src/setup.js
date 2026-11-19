@@ -234,8 +234,8 @@ export async function placeOrder(ctx, company, person, itemId) {
   if (!(await prov.capabilities()).spend) throw new ApiError(409, 'unsupported', 'This credit provider does not support spending.');
   const ref = await accountRef(ctx, company, person);
   const rop = await intend(ctx, company, { kind: 'order_reserve', key: 'ores:' + id, subject: id, params: { credits: item.credits, item: item.name, person: person.id } }); // before the call: an orphan hold is found by the tick
-  const res = await run(ctx, company, rop, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: id, idem: 'order:' + id, item: p.item }));
-  if (res.state === 'refused') throw new ApiError(res.code === 'insufficient_credits' ? 402 : 502, res.code, res.message ?? res.result?.message ?? 'The credit provider refused this order.');
+  const res = await run(ctx, company, rop, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: id, idem: 'order:' + id, item: p.item }), { believe: ['insufficient_credits', 'no_item', 'price_changed'] });
+  if (res.state === 'refused') throw new ApiError(res.code === 'insufficient_credits' ? 402 : ['no_item', 'price_changed'].includes(res.code) ? 409 : 502, res.code, res.message ?? res.result?.message ?? 'The credit provider refused this order.');
   if (res.state !== 'landed') throw new ApiError(502, res.code ?? 'provider_down', 'The credit provider did not confirm the order; nothing was ordered.');
   const hold = { hold_id: res.result.hold_id };
   const approve = item.needs_approval === 0;
@@ -246,7 +246,12 @@ export async function placeOrder(ctx, company, person, itemId) {
 /** Call the provider for an order decision and record it (once). */
 async function driveOrder(ctx, company, op, actorId = 'system') {
   const prov = ctx.provider(company);
-  const out = await run(ctx, company, op, (p) => (p.accept ? prov.captureSpend({ holdId: p.hold, idem: 'cap:' + op.subject }) : prov.releaseSpend({ holdId: p.hold, idem: 'rel:' + op.subject })));
+  // A hold that ran out or was closed (Moneypenny holds expire): releasing it is done (the credits are back); capturing it is refused for good: the order EXPIRES, nobody is charged.
+  const out = await run(ctx, company, op, (p) => (p.accept ? prov.captureSpend({ holdId: p.hold, idem: 'cap:' + op.subject }) : prov.releaseSpend({ holdId: p.hold, idem: 'rel:' + op.subject })), { okCodes: op.params.accept ? [] : ['hold_expired'], believe: ['hold_expired'] });
+  if (out.state === 'refused' && out.code === 'hold_expired') {
+    await commit(ctx, company.id, actorId, 'order.expired', { id: op.subject, code: out.code }, [["UPDATE catalogue_order SET state = 'expired' WHERE id = ? AND state = 'reserved'", op.subject], ['UPDATE provider_op SET settled = 1 WHERE id = ?', op.id]]);
+    return out;
+  }
   if (out.state === 'landed') {
     const state = op.params.accept ? 'captured' : 'released';
     await commit(ctx, company.id, actorId, 'order.' + state, { id: op.subject }, [['UPDATE provider_op SET settled = 1 WHERE id = ?', op.id], ["UPDATE catalogue_order SET state = ? WHERE id = ? AND state = 'reserved'", state, op.subject]], { onlyIfChanged: true });
@@ -257,9 +262,12 @@ async function driveOrder(ctx, company, op, actorId = 'system') {
 /** The tick: finish order decisions that were cut short, and give back a hold reserved for an order that was never recorded. */
 export async function finishOrders(ctx, company) {
   let n = 0;
-  for (const op of await unsettled(ctx, company.id, 'order_decide')) { try { if ((await driveOrder(ctx, company, op)).state === 'landed') n++; } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
+  for (const op of await unsettled(ctx, company.id, 'order_decide')) {
+    // A decision the provider refused (an auto-approved order whose decision was refused): it is not left behind. The order stays 'reserved' (shown to the admin) and a new decision may be made.
+    if (op.state === 'refused' && op.last_code !== 'hold_expired') { await ctx.db.run("DELETE FROM provider_op WHERE id = ? AND state = 'refused'", op.id); continue; }
+    try { if ((await driveOrder(ctx, company, op)).state === 'landed') n++; } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
   for (const op of await unsettled(ctx, company.id, 'order_reserve')) {
-    if (await ctx.db.first('SELECT 1 x FROM catalogue_order WHERE id = ?', op.subject)) { await settleOp(ctx, op); continue; }
+    if (await ctx.db.first('SELECT 1 x FROM catalogue_order WHERE id = ?', op.subject) || op.state === 'refused') { await settleOp(ctx, op); continue; }
     if (ctx.now() - op.created_at < 600_000) continue;
     try {
       const prov = ctx.provider(company);
@@ -284,6 +292,7 @@ export async function decideOrder(ctx, company, actor, orderId, accept) {
   const op = await intend(ctx, company, { kind: 'order_decide', key: 'odec:' + o.id, subject: o.id, params: { accept: !!accept, hold: o.hold_id } });
   if (op.params.accept !== !!accept) throw new ApiError(409, 'already_decided', 'This order was already decided.');
   const out = await driveOrder(ctx, company, op, actor.id);
+  if (out.state === 'refused' && out.code === 'hold_expired') return { id: o.id, state: 'expired' };
   if (out.state === 'refused') { await ctx.db.run("DELETE FROM provider_op WHERE id = ? AND state = 'refused'", op.id); throw new ApiError(502, out.code, 'The credit provider refused this decision.'); } // a clear first no: a new decision may be tried
   if (out.state !== 'landed') throw new ApiError(502, out.code ?? 'provider_down', 'The credit provider did not confirm; the decision is kept and the tick finishes it.');
   return { id: o.id, state };

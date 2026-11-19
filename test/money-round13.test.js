@@ -150,7 +150,8 @@ test('T7: handed-back credits do not count as earned; a revive that cannot take 
   await w2.db.run("UPDATE correction SET state='cleared' WHERE id='crx'");
   fixed = true;
   await reviveFailedRewards(w2.ctx, w2.company);
-  assert.equal(await auditN(w2, 'reward.take_lost'), 1);
+  assert.equal(await auditN(w2, 'reward.take_lost'), 0, 'the shortfall is paid as its own grant (round 16)');
+  assert.equal((await w2.db.first("SELECT COUNT(*) n FROM reward WHERE idem_key LIKE '%:short'")).n, 1);
 });
 
 test('T8: two overlapping decisions on one order call the provider once', async () => {

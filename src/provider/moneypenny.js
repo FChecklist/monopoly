@@ -9,7 +9,13 @@ import { hmacHex, sha256Hex, newId } from '../util.js';
 const MAP_CODES = {
   insufficient_credits: 'insufficient_credits', cap_reached: 'cap_reached', daily_cap_reached: 'cap_reached', limit_reached: 'cap_reached',
   account_frozen: 'account_closed', frozen: 'account_closed', no_account: 'account_closed', rate_limited: 'rate_limited', conversion_off: 'unsupported',
-  bad_email: 'bad_request', below_minimum: 'bad_request', cap_required: 'bad_request', more_than_convertible: 'bad_request', bad_json: 'bad_request', idempotency_conflict: 'bad_request',
+  bad_email: 'bad_request', below_minimum: 'bad_request', cap_required: 'bad_request', more_than_convertible: 'bad_request', bad_json: 'bad_request',
+  // A key reused with another body is OUR key scheme, not this person's fault: the outcome of the first call is unknown, so it is a retriable ambiguity (never a permanent no).
+  idempotency_conflict: 'idempotency_conflict',
+  // Shop orders: a hold that ran out or was closed, an item that is gone or re-priced, are definitive answers for THAT order.
+  hold_expired: 'hold_expired', hold_closed: 'hold_expired', hold_not_open: 'hold_expired', no_hold: 'hold_expired', no_item: 'no_item', price_changed: 'price_changed',
+  // The provider side is switched off or the sender is not allowed (nobody's fault, retriable and alerted): never fails a reward.
+  blocked_domain: 'misconfigured', paused: 'unavailable', paused_global: 'unavailable', too_many_events: 'rate_limited', duplicate_ref: 'duplicate',
   idempotency_key_required: 'misconfigured', wrong_key_type: 'unauthorized', unsigned: 'unauthorized', bad_signature: 'unauthorized', stale_timestamp: 'unauthorized', replayed: 'unauthorized',
 };
 
@@ -30,6 +36,7 @@ export function mapStatus(status, bodyCode) {
   if ([401, 403, 408, 425].includes(status)) return 'unauthorized';
   if (status === 404 || status === 409) return 'misconfigured';
   if (status === 402) return 'insufficient_credits';
+  if (status === 410) return 'hold_expired'; // a hold that is gone (shop orders)
   if ([400, 413, 414, 415, 422, 431].includes(status)) return 'bad_request';
   return 'misconfigured'; // 3xx, 405, 410 and anything unexpected: our setup, not the person
 }
@@ -67,7 +74,8 @@ export class MoneypennyProvider {
     try { j = await res.json(); } catch { /* not json */ }
     if (!res.ok || j?.ok === false) {
       const body = j?.error?.code;
-      const code = mapStatus(res.status, typeof body === 'string' ? body : undefined);
+      let code = mapStatus(res.status, typeof body === 'string' ? body : undefined);
+      if ((code === 'hold_expired' || code === 'no_item' || code === 'price_changed') && !path.startsWith('/v1/spend/')) code = 'misconfigured'; // order codes only mean something on a spend call
       throw new ProviderError(code, j?.error?.message ?? body ?? ('http_' + res.status));
     }
     // A 200 whose body is not the JSON object API.md promises (a proxy page, a cut answer) is a provider fault, never a person's problem: retry.
@@ -94,11 +102,13 @@ export class MoneypennyProvider {
   }
   async reserveSpend({ accountRef, amount, ref, idem, item }) {
     const { json } = await this.#call('POST', '/v1/spend/reserve_item', { email: accountRef, product: this.cfg.product ?? 'floor', item: item ?? ref, order_ref: ref, credits: amount }, idem);
+    if (typeof json.hold_id !== 'string' || !json.hold_id) throw new ProviderError('bad_response', 'Moneypenny did not return a hold.', { retriable: true });
     return { hold_id: json.hold_id, credit_applied: json.credits };
   }
   async captureSpend({ holdId, idem }) {
     const { json } = await this.#call('POST', '/v1/spend/capture', { hold_id: holdId }, idem);
-    return { entry_id: json.status === 'captured' ? 'cap_' + holdId : null };
+    if (json.status !== 'captured') throw new ProviderError('bad_response', 'Moneypenny did not confirm the capture.', { retriable: true });
+    return { entry_id: 'cap_' + holdId };
   }
   async releaseSpend({ holdId, idem }) {
     await this.#call('POST', '/v1/spend/release', { hold_id: holdId }, idem);

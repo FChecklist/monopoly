@@ -40,7 +40,8 @@ export const settleOp = async (ctx, op) => (await ctx.db.run('UPDATE provider_op
  * Returns { state, result, code, busy, exhausted }. state is the row's state afterwards. Never throws a ProviderError.
  * okCodes: provider codes that mean "it is done" (e.g. hold_expired on a release).
  */
-export async function run(ctx, company, op, call, { okCodes = [], believeRefusal = true } = {}) {
+export async function run(ctx, company, op, call, { okCodes = [], believeRefusal = true, believe = [] } = {}) {
+  // believe: codes that are definitive for THIS operation even after earlier tries (the provider replays a landed call's answer for the same key, so such a code means it did not land).
   const reread = async () => parse(await ctx.db.first('SELECT * FROM provider_op WHERE id = ?', op.id));
   const view = (c, extra = {}) => ({ state: c.state, result: c.result, code: c.last_code, ...extra });
   const terminal = (c) => c.state === 'landed' || c.state === 'refused';
@@ -71,7 +72,7 @@ export async function run(ctx, company, op, call, { okCodes = [], believeRefusal
   } catch (e) {
     if (!(e instanceof ProviderError)) { await ctx.db.run('UPDATE provider_op SET claim_until = 0 WHERE id = ? AND claim_token = ?', op.id, token); throw e; } // our own bug: the lease is released, the row is already 'unknown', the try stays counted
     if (okCodes.includes(e.code)) return (await done('landed', { code: e.code }, e.code)) ? { state: 'landed', result: { code: e.code } } : stored();
-    if (!e.retriable && before === 0 && believeRefusal) return (await done('refused', { message: e.message }, e.code)) ? { state: 'refused', code: e.code, message: e.message } : stored(); // a clear first "no": nothing happened
+    if (!e.retriable && ((before === 0 && believeRefusal) || believe.includes(e.code))) return (await done('refused', { message: e.message }, e.code)) ? { state: 'refused', code: e.code, message: e.message } : stored(); // a clear first "no": nothing happened
     // an outage, or a "no" after an earlier try that may have landed: not believed, the same key is replayed. A try that provably never reached the provider's books is not counted.
     if (await done('unknown', undefined, e.code, NOT_LANDED.has(e.code))) return { state: 'unknown', code: e.code };
     return stored();

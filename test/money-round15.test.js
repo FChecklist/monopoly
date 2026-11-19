@@ -69,8 +69,8 @@ test('W5 v1 credit path: no season hold, and a downgrade books a correction inst
   assert.equal((await w.db.first('SELECT hold_id h FROM season WHERE id=?', w.season)).h, null);
   await entitle(w, 100); const before = await provBal(w);
   await entitle(w, 40).catch(() => {});
-  assert.equal(await provBal(w), before + 20, 'nothing is taken back from the account; the lower tier is paid less the recovery (20)');
+  assert.equal(await provBal(w), before, 'nothing is taken back from the account and nothing is paid again');
   const c = await w.db.first('SELECT COALESCE(SUM(amount),0) a, COALESCE(SUM(recovered),0) r FROM correction');
-  assert.equal(c.a, 100, 'the whole earlier credit is owed as a correction'); assert.equal(c.r, 20, 'recovered from the new payment, capped by offset_max_pct');
+  assert.equal(c.a, 60, 'only the difference is owed'); assert.equal(c.r, 0);
   assert.equal((await w.db.first('SELECT COUNT(*) n FROM provider_op')).n, 0, 'no hold / debit / reverse operation exists');
 });

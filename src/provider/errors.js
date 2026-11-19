@@ -1,7 +1,7 @@
 // Errors a credit provider may raise. Stable codes (contract v1).
-export const PROVIDER_CODES = ['insufficient_budget', 'hold_expired', 'account_closed', 'cap_reached', 'duplicate', 'unsupported', 'rate_limited', 'provider_down', 'bad_request', 'insufficient_credits', 'unauthorized', 'misconfigured', 'timeout', 'bad_response'];
+export const PROVIDER_CODES = ['insufficient_budget', 'hold_expired', 'account_closed', 'cap_reached', 'duplicate', 'unsupported', 'rate_limited', 'provider_down', 'bad_request', 'insufficient_credits', 'unauthorized', 'misconfigured', 'timeout', 'bad_response', 'no_item', 'price_changed', 'idempotency_conflict', 'unavailable'];
 /** Codes that describe the provider, its link or our configuration, never one person's account: the call may be repeated. ONE source of truth for every site that asks 'retriable?'. */
-export const RETRIABLE_CODES = new Set(['provider_down', 'rate_limited', 'timeout', 'unavailable', 'unauthorized', 'misconfigured', 'bad_config', 'bad_response']);
+export const RETRIABLE_CODES = new Set(['provider_down', 'rate_limited', 'timeout', 'unavailable', 'unauthorized', 'misconfigured', 'bad_config', 'bad_response', 'idempotency_conflict']);
 export class ProviderError extends Error {
   constructor(code, message = code, { retriable = false } = {}) {
     super(message);

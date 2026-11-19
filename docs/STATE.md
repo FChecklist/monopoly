@@ -46,13 +46,14 @@ Scans clean: scripts/scan-words.js, scripts/scan-secrets.js.
 ## Handover (19 Nov 2026, after audit round 14)
 State: v1 is CREDIT-ONLY. NOT deployed; deploy stays ON HOLD (needs the owner's direct confirmation of the repo and BOSS's release; see docs/DEPLOY.md).
 
-Audit rounds 6-15, one line each:
-- 6: FAIL (K1 hand-back lost, K2 reversal vs appeal race); fixed. 7: FAIL (L1 settle block never cleared); fixed. 8: M1 debit/restore generation; fixed.
-- 9: FAIL (P1-P5 status mapping, restore marker, revivable failed rewards); fixed. 10: FAIL (R1-R8 config faults, pending-debit marker, lost reverse reply); fixed.
-- 11: FAIL (S1-S3 old hold release, orphan hold, ambiguity guards); fixed. 12: FAIL (T1-T8 reverse retry cap, hold pre-record, stale snapshots); fixed.
-- 13: 13A PASS, 13B FAIL (U1-U6 overlapping debit/reverse workers, give-up permanence, audit growth); answered with the provider_op state machine (docs/design/PROVIDER-OPS.md).
-- 14: both FAIL, only inside provider_op / raiseBudget (V1 hung op silent, V2 overlapping raise leaks a hold, V3 stale reply overwrote landed); V1 and V3 fixed in round 15, V2 gets a hold_id compare-and-set; the rest is moot in v1 (below).
-- 15: in this commit (test/money-round15.test.js).
+Audit rounds 6-16, verdicts (A = money, B = simulation / second auditor):
+- 6: A FAIL (K1 hand-back lost, K2 reversal vs appeal race), B PASS. 7: A FAIL (L1 settle block never cleared). 8: FAIL (M1 debit/restore generation).
+- 9: both FAIL (P1-P5 status mapping, restore marker, revivable failed rewards). 10: both FAIL (R1-R8 config faults, pending-debit marker, lost reverse reply).
+- 11: A PASS, B FAIL (S1-S3 old hold release, orphan hold, ambiguity guards). 12: both FAIL (T1-T8 reverse retry cap, hold pre-record, stale snapshots).
+- 13: A PASS, B FAIL (U1-U6 overlapping workers, give-up permanence, audit growth); answered with the provider_op state machine (docs/design/PROVIDER-OPS.md).
+- 14: both FAIL, only inside provider_op / raiseBudget (V1-V5). Answer: v1 became credit-only (below), V1 and V3 fixed, V2 got a hold_id compare-and-set.
+- 15: both FAIL on the credit path (X1-X9: expiring order holds, v1 delta settlement, partial grants, no scheduler, revive underpay, error mapping, overview). Fixed in round 16 (test/money-round16.test.js).
+- 16: awaiting the next audit.
 
 NOT ENABLED IN v1 (code kept, unreachable, unaudited): season budget holds, credit-loss penalties (debit and restore), credit reversals. src/v1.js is the one place: every provider goes through a wrapper (src/provider/index.js) that reports hold, debit and reverse as false; a real provider that declares them is a configuration error ('not enabled in v1'); the setting penalty_credit_loss cannot be switched on; makeCtx refuses to start with the test switch in a production environment. Only the demo provider of a non-live company with FUTURE_OPS=1 (tests, local demos) reaches those paths; the old tests of those paths (money-round2..14) run with that switch and are 'future'. Without it (world({ v1: true })): no season hold, a lost tier is a correction instead of a reverse, penalties are points and steps only.
 

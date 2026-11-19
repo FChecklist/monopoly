@@ -3,7 +3,7 @@
 // A positive difference is paid once (idempotent). A negative one is reversed. So a later cancellation is corrected at the next close.
 import { settingsOf } from './config.js';
 import { grant, reverseReward, seasonAt, healPendingReverses } from './rewards.js';
-import { periodOf, prevPeriod, DAY, sha256Hex } from './util.js';
+import { periodOf, prevPeriod, DAY, sha256Hex, newId, monthKey, dayKey } from './util.js';
 import { commit } from './audit.js';
 import { ProviderError } from './provider/errors.js';
 
@@ -47,11 +47,19 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
   let paid = await paidSum(ctx, company.id, person.id, groupKey);
   const out = { paid: 0, reversed: healed };
+  // v1 (no reversal at the provider): a drop is a DELTA. Rows that were never sent are voided; what was already sent stays and the difference is owed as a correction (no reverse, no re-grant of the whole entitlement).
+  let canReverse = false;
+  try { canReverse = (await ctx.provider(company).capabilities()).reverse === true; }
+  catch (e) { // a provider or configuration fault: a drop stays due and is decided at the next close (never booked as a correction on a guess)
+    if (!(e instanceof ProviderError)) throw e;
+    if (entitled < paid) { out.skipped = 1; out.skipCode = e.code ?? 'pending'; return out; }
+  }
   if (entitled < paid) {
     // Reverse newest rows first until paid <= entitled. Any overshoot is topped up below.
     const rows = await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=0 AND amount>0 AND kind != 'reversal' AND state IN ('queued','sent','waiting') ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
     for (const r of rows) {
       if (paid <= entitled) break;
+      if (!canReverse && !(r.state === 'waiting' || (r.state === 'queued' && r.attempts === 0))) continue; // sent (or maybe sent) rows are not touched in v1
       // Reversing a whole row may overshoot; the difference is paid again below. When no published season covers the period (it closed),
       // that top-up could not be placed and the person would end with LESS than earned: keep the row, the person is overpaid, never underpaid.
       if (paid - r.amount < entitled && !(await seasonAt(ctx, company.id, at))) { out.kept = (out.kept ?? 0) + 1; out.keptAmount = paid - entitled; continue; }
@@ -61,11 +69,25 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
       paid -= r.amount;
     }
   }
+  if (!canReverse && entitled < paid) {
+    const d = paid - entitled;
+    const n = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%'", company.id, person.id, groupKey)).n;
+    const reason = 'tier_lost:' + (label ?? kind);
+    const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`;
+    try {
+      await commit(ctx, company.id, 'system', 'reward.reduce', { person: person.id, group: groupKey, owed: d, entitled }, [
+        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,NULL,NULL,'recorded',?,?,0)",
+          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), JSON.stringify({ reason, delta: true, owed: d }), ctx.now()],
+        ["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", newId('cr'), company.id, person.id, d, reason, ctx.now()],
+      ]);
+      out.owed = d;
+    } catch (e) { if (!/idem_key/i.test(String(e?.message))) throw e; } // another settle run did the same delta
+  }
   // `paid` and the reversal count `gen` come from ONE statement, so the key below never mixes a stale paid with a fresher gen.
   const snap = await ctx.db.first(`SELECT
     (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}) AS paid,
-    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap'))) AS gen`,
-  company.id, person.id, groupKey, company.id, person.id, groupKey);
+    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
+  company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.
@@ -75,7 +97,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     // under a new key; a voided earlier grant did not, so it replays (a void row is never paid a second time).
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
     const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n; // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
-    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale ? `:x${stale}` : '');
+    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed'", company.id, person.id, groupKey)).n < 3 ? `:x${stale}` : '');
     const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system' });
     out.paid = g.paid;
     if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';

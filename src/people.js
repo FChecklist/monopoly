@@ -179,7 +179,7 @@ export async function correctDetails(ctx, company, actor, personId, input) {
     if (!isEmail(e)) throw new ApiError(400, 'bad_email', 'A valid work e-mail is needed.');
     const eh = await ctx.hash('email', e);
     if (await ctx.db.first('SELECT id FROM app_user WHERE email_hash = ? AND id != ?', eh, p.id)) throw new ApiError(409, 'email_taken', 'This e-mail cannot be used. It may already be in use.');
-    sets.push('email_hash = ?', 'email_sealed = ?'); par.push(eh, await ctx.seal(e, 'app_user.email:' + p.id)); fields.push('email');
+    sets.push('provider_account_ref = NULL'); sets.push('email_hash = ?', 'email_sealed = ?'); par.push(eh, await ctx.seal(e, 'app_user.email:' + p.id)); fields.push('email');
   }
   if (!sets.length) throw new ApiError(400, 'nothing', 'Send name, work_id or email.');
   await commit(ctx, company.id, actor.id, 'person.correct', { person: p.id, fields }, [['UPDATE app_user SET ' + sets.join(', ') + ' WHERE id = ? AND company_id = ?', ...par, p.id, company.id]]);

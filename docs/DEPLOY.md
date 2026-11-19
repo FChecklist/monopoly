@@ -58,3 +58,18 @@ Never type a value into chat, a file in the repo, or a shell history you share.
 * DNS: the record id of the CNAME, and the previous value if one existed
 * Keys: the key ids of every ingest or provider key you created, with their labels
 * AI: confirm the kill switch works (Admin > AI access > Switch AI off) and note who may press it
+
+## The clock (tick): who runs it
+The game does nothing by itself. Retries, releases, reversals, penalty notices and period settlement are all done by one function, tick(). Three ways to run it, use at least one:
+1. Lazy (built in): any signed-in request runs a small tick when none ran for 5 minutes (one winner per window, errors never reach the user). This keeps a company that is used daily moving, nothing to set up. Set LAZY_TICK=0 to switch it off.
+2. External scheduler (recommended for a company that may sit unused): call the signed route POST /api/ingest/tick with an ingest key (CONTRACT/signed-v1.md) every 5 to 15 minutes. scripts/tick.js does the signing: `TICK_URL=https://<host> TICK_KEY_ID=<id> TICK_SECRET=<secret> node scripts/tick.js`.
+   - Cloudflare: a Cron Trigger on a tiny separate Worker that makes the same signed call (keep the secret as a Worker secret, never in the repo).
+   - GitHub Actions: copy docs/templates/tick-workflow.yml to .github/workflows/ (it is NOT active where it is). It needs two repository secrets the owner adds (TICK_KEY_ID, TICK_SECRET) and one variable (TICK_URL). No secret is stored in the repo.
+3. The admin button (POST /api/admin/tick).
+The admin overview shows last_tick_at and raises an alert when nothing ran for over an hour.
+
+## Moneypenny caps versus game caps
+Moneypenny's own default limits are: lifetime 800 credits per person, manual bonus maximum 500, 20 events per person per day. The game's defaults are higher (season cap per person 15000, event cap 1000, daily event limit 60). Where the game promises more than Moneypenny grants, Moneypenny grants only part: the row is recorded as a partial grant and the remainder is retried every 6 hours (up to 20 times); the admin overview lists open_partial_grants. Raise Moneypenny's limits for the tenant or lower the game caps: the overview shows a warning for each game cap above these numbers (no network call; the numbers are in src/config.js, MNP_LIMITS).
+
+## Shop orders and expiring holds
+Moneypenny holds expire (about 15 minutes plus a grace). An order that is captured after that is refused for good (hold_expired): the order becomes "expired", nobody is charged, and the person orders again. Orders that cannot finish for a day are shown in the overview (open_orders_stuck).

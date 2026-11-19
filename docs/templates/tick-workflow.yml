@@ -1,0 +1,19 @@
+# TEMPLATE, NOT ACTIVE. Copy to .github/workflows/tick.yml to switch it on (see docs/DEPLOY.md, "The clock").
+# Needs repository secrets TICK_KEY_ID and TICK_SECRET and a repository variable TICK_URL, all added by the owner. No secret lives in this repo.
+name: tick
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: node scripts/tick.js
+        env:
+          TICK_URL: ${{ vars.TICK_URL }}
+          TICK_KEY_ID: ${{ secrets.TICK_KEY_ID }}
+          TICK_SECRET: ${{ secrets.TICK_SECRET }}

@@ -89,7 +89,7 @@ export async function grant(ctx, company, p) {
       // Period bonuses sit under their own cap and are exempt from the per-month cap; they still count to the season cap.
       if (!p.periodBonus) caps.push({ name: 'person_month_cap', cap: capOf(s, 'cap_person_month'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND month_key=? AND kind != 'penalty_return' AND state IN ${COUNT}`, params: [company.id, p.person.id, mk] });
       if (season) caps.push({ name: 'season_cap', cap: capOf(s, 'cap_person_season'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND season_id=? AND state IN ${COUNT}`, params: [company.id, p.person.id, season.id] });
-      if (p.periodBonus) caps.push({ name: 'period_bonus_cap', cap: capOf(s, 'cap_period_bonus_person_period'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND period_key=? AND kind IN ('tier','streak','team') AND state IN ${COUNT}`, params: [company.id, p.person.id, p.periodKey ?? ''] });
+      if (p.periodBonus) caps.push({ name: 'period_bonus_cap', cap: capOf(s, 'cap_period_bonus_person_period'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND period_key=? AND (kind IN ('tier','streak','team') OR (kind = 'reversal' AND substr(group_key, 1, instr(group_key, ':') - 1) IN ('tier','streak','team'))) AND state IN ${COUNT}`, params: [company.id, p.person.id, p.periodKey ?? ''] });
     }
     for (const c of caps) clamp(c.cap, await one(ctx, c.sql, ...c.params), c.name);
     if (room <= 0) return { paid: 0, reason: why[0] ?? 'cap_reached' };
@@ -104,7 +104,7 @@ export async function grant(ctx, company, p) {
       if (funded + amount + reserve > season.budget) state = 'waiting';
     }
     let offset = 0, takes = [];
-    if (state === 'queued' && !NO_TAKE.has(p.kind)) ({ offset, takes } = await takesFor(ctx, company, p.person.id, amount, s));
+    if (state === 'queued' && !NO_TAKE.has(p.kind) && !p.noTake) ({ offset, takes } = await takesFor(ctx, company, p.person.id, amount, s));
 
     const guards = caps.map((c) => ({ sql: `(${c.sql}) + ? <= ?`, params: [...c.params, amount, c.cap] }));
     if (state === 'queued' && season) guards.push({ sql: `(${fundedSql}) + ? <= ?`, params: [company.id, season.id, amount + reserve, season.budget] });
@@ -161,6 +161,15 @@ export async function sendReward(ctx, company, r) {
     return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
   }
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
+  if (!person || person.erased_at) { // an erased leaver cannot be paid: the row is voided with a plain reason (the corrections it took go back), it never throws
+    const n0 = JSON.parse(r.note || '{}');
+    const own = "EXISTS (SELECT 1 FROM reward WHERE id = ? AND state = 'queued')";
+    const st = [];
+    for (const [cid, t] of n0.takes ?? []) st.push([`UPDATE correction SET recovered = MAX(0, recovered - ?), state = CASE WHEN state = 'cleared' THEN 'open' ELSE state END WHERE id = ? AND ${own}`, t, cid, r.id]);
+    st.push(["UPDATE reward SET state='void', reversed=1, last_error='person_erased' WHERE id=? AND state='queued'", r.id]);
+    await commit(ctx, company.id, 'system', 'reward.void', { orig: r.id, reason: 'person_erased' }, st);
+    return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
+  }
   const season = r.season_id ? await ctx.db.first('SELECT * FROM season WHERE id = ?', r.season_id) : null;
   // Mark the attempt BEFORE the call. If we crash between the provider crediting and our receipt, attempts > 0 tells
   // everybody this credit may already exist at the provider, so the row is never voided, only sent and then reversed.
@@ -179,7 +188,9 @@ export async function sendReward(ctx, company, r) {
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, sent_amount=?, last_error=? WHERE id=? AND state='queued'", res.entry_id ?? r.idem_key, ctx.now(), got, got < r.sent_amount ? 'partial_grant' : null, r.id);
   } catch (e) {
     if (!(e instanceof ProviderError)) throw e;
-    if (e.retriable || isTransient(e.code)) { // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
+    if (e.code === 'duplicate') { // the provider says this reference is already credited (duplicate_ref): it landed earlier, mark it sent
+      await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, last_error=NULL WHERE id=? AND state='queued'", r.idem_key, ctx.now(), r.id);
+    } else if (e.retriable || isTransient(e.code)) { // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
       await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id);
       // At most ONE audit line per row per day (a flapping code A,B,A,B must not write at every change), so a long outage never grows the audit chain.
       if (r.last_error !== e.code && !(await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.send_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, `"id":"${r.id}"`))) { try { await commit(ctx, company.id, 'system', 'reward.send_error', { id: r.id, code: e.code }); } catch { /* the next try writes it */ } }
@@ -228,11 +239,11 @@ export const openFailedRewards = async (ctx, companyId) => (await ctx.db.first('
  * Admin helper, like clearBlocked: put every failed event reward back to 'waiting'; releaseWaiting then runs the whole check again and sends it.
  * It keeps the SAME idempotency key (see failReward), so it cannot pay twice. A row is revived at most MAX_REVIVES times.
  */
-export async function reviveFailedRewards(ctx, company, actor = 'admin') {
+export async function reviveFailedRewards(ctx, company, actor = 'admin', { force = false } = {}) {
   let revived = 0;
   for (const r of await ctx.db.all('SELECT * FROM reward WHERE ' + REVIVABLE + ' ORDER BY created_at', company.id)) {
     const n = JSON.parse(r.note || '{}');
-    if ((n.revives ?? 0) >= MAX_REVIVES) continue;
+    if ((n.revives ?? 0) >= MAX_REVIVES && !force) continue; // force: an admin may go beyond the limit
     // The first credit may have reached the provider: the revived credit must repeat the SAME amount (same key), so the amount and the takes of the first try are kept.
     const note = JSON.stringify({ ...n, offset: r.amount - r.sent_amount, takes: [], takes0: n.takes ?? [], sent0: r.sent_amount, revives: (n.revives ?? 0) + 1 });
     const stmts = [["UPDATE reward SET state='waiting', last_error='revived', note=? WHERE id=? AND state='failed' AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))", note, r.id]];
@@ -262,7 +273,38 @@ export async function healPendingReverses(ctx, company, personId, groupKey) {
   return healed;
 }
 
-/** Retry everything that is "on its way". Run by the admin button and by the scheduled trigger. */
+const PARTIAL_EVERY = 6 * 3600_000, PARTIAL_MAX = 20;
+/** Rows that were granted only in part (the provider's own cap was short): count of rows whose remainder is still open. */
+export const openPartialGrants = async (ctx, companyId) => (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'sent' AND reversed = 0 AND last_error = 'partial_grant' AND amount - COALESCE(json_extract(note, '$.offset'), 0) > sent_amount", companyId)).n;
+/**
+ * The remainder of a partial grant is paid later, under its own key (<key>:r<k>), at most every 6 hours and PARTIAL_MAX times; a zero grant moves to a new key (the provider
+ * replays a zero answer for the same key). What was really granted is added to sent_amount in one guarded write, so a reversal owes only what was credited.
+ */
+export async function topUpPartials(ctx, company) {
+  let paid = 0;
+  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id = ? AND state = 'sent' AND reversed = 0 AND last_error = 'partial_grant' ORDER BY created_at LIMIT 50", company.id)) {
+    const note = JSON.parse(r.note || '{}');
+    const rem = r.amount - (note.offset ?? 0) - r.sent_amount;
+    if (rem <= 0) { await ctx.db.run("UPDATE reward SET last_error = NULL WHERE id = ? AND last_error = 'partial_grant'", r.id); continue; }
+    const k = note.remK ?? 0;
+    if (k >= PARTIAL_MAX || ctx.now() - (note.remAt ?? r.sent_at ?? 0) < PARTIAL_EVERY) continue;
+    const save = (extra, add) => ctx.db.run("UPDATE reward SET sent_amount = sent_amount + ?, last_error = CASE WHEN sent_amount + ? >= amount - ? THEN NULL ELSE 'partial_grant' END, note = ? WHERE id = ? AND sent_amount = ?", add, add, note.offset ?? 0, JSON.stringify({ ...note, ...extra }), r.id, r.sent_amount);
+    try {
+      const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
+      if (!person || person.erased_at) continue;
+      const res = await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: rem, reasonCode: r.kind, ref: r.id, idem: `${r.idem_key}:r${k}` });
+      const got = Number.isInteger(res.granted) && res.granted > 0 && res.granted < rem ? res.granted : rem;
+      await save({ remK: got < rem ? k + 1 : k, remAt: ctx.now() }, got);
+      paid += got;
+    } catch (e) {
+      if (!(e instanceof ProviderError)) throw e;
+      if (e.code === 'cap_reached') await save({ remK: k + 1, remAt: ctx.now() }, 0); // a zero grant: next time under a new key
+    }
+  }
+  return paid;
+}
+
+/** Retry everything that is "on its way". Run by tick() (admin button, signed /api/ingest/tick, or the lazy tick). */
 export async function retryQueued(ctx, company, limit = 100) {
   let sent = 0, stuck = 0;
   limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 100));
@@ -272,6 +314,7 @@ export async function retryQueued(ctx, company, limit = 100) {
     if (out.state === 'sent') sent++;
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
   }
+  try { await topUpPartials(ctx, company); } catch { /* the next tick */ }
   try { await releaseClosedHolds(ctx, company); await releasePendingHolds(ctx, company); } catch { /* housekeeping never stops the sending: it runs again at the next tick */ }
   return { sent, stuck };
 }
@@ -384,7 +427,7 @@ export async function releaseWaiting(ctx, company) {
     }
     const res = await commit(ctx, company.id, 'system', 'reward.release', { id: r.id, season: season.id, offset }, stmts, { onlyIf: { sql: 'SELECT 1 FROM reward WHERE id = ? AND note = ?', params: [r.id, newNote] } });
     if (res[0].changes === 0) continue;
-    await sendReward(ctx, company, await ctx.db.first('SELECT * FROM reward WHERE id=?', r.id));
+    try { await sendReward(ctx, company, await ctx.db.first('SELECT * FROM reward WHERE id=?', r.id)); } catch { /* one bad row never stops the others: the tick sends it */ }
     moved++;
   }
   return { moved, voided };
@@ -398,7 +441,18 @@ async function sameTakes(ctx, company, n, r) {
     if (c && c.amount - c.recovered >= t) takes.push([cid, t]);
   }
   const offset = r.amount - n.sent0, got = takes.reduce((a, [, t]) => a + t, 0);
-  if (got < offset) { try { await commit(ctx, company.id, 'system', 'reward.take_lost', { id: r.id, lost: offset - got }); } catch { /* the next release writes it */ } }
+  if (got < offset) {
+    if (r.attempts <= 1) { // the first try was refused cleanly (nothing can have landed): compute the amount fresh, under a NEW key
+      const fresh = await takesFor(ctx, company, r.person_id, r.amount, settingsOf(company));
+      await ctx.db.run("UPDATE reward SET idem_key = ? WHERE id = ? AND state = 'waiting'", String(r.idem_key).split(':v')[0] + ':v' + (n.revives ?? 1), r.id);
+      n.sent0 = null; n.takes0 = [];
+      return fresh;
+    }
+    // The first try may have landed: the amount must repeat. The shortfall (the part of the corrections that is gone) is paid as its own grant so the person is not charged twice.
+    const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
+    const g = person ? await grant(ctx, company, { person, kind: r.kind, amount: offset - got, idem: r.idem_key + ':short', groupKey: r.group_key, periodKey: r.period_key, at: n.at ?? r.created_at, eventId: r.event_id, bypassCaps: true, noTake: true, actor: 'system' }) : { paid: 0 };
+    if (!(g.paid > 0)) { try { await commit(ctx, company.id, 'system', 'reward.take_lost', { id: r.id, lost: offset - got }); } catch { /* the next release writes it */ } }
+  }
   return { offset, takes };
 }
 /** Void a waiting row that can never be released. Corrections it had taken go back. No audit line if somebody else got there first. */

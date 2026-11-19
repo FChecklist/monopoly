@@ -302,7 +302,7 @@ async function reversePenalty(ctx, company, c0, actorId, note, code = 'custom') 
   return { id: c.id, state: 'reversed' };
 }
 
-/** Move the clock: apply after notice, escalate appeals, and reverse by silence. Run by the scheduled trigger and on each admin visit. */
+/** Move the clock: apply after notice, escalate appeals, and reverse by silence. Run by tick() (admin button, signed /api/ingest/tick, or the lazy tick), see docs/DEPLOY.md. */
 export async function tickPenalties(ctx, company) {
   const now = ctx.now(), out = { applied: 0, escalated: 0, reversed: 0, errors: 0, repaired: 0 };
   // A reversal that committed but whose credit hand-back never landed (crash, contention): the penrev: reward is missing. Run it again (idempotent).

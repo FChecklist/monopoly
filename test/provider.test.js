@@ -145,7 +145,7 @@ test('R10-1: the adapter maps every status to a code the game classifies correct
     [403, undefined, 'unauthorized', true], [408, undefined, 'unauthorized', true], [425, undefined, 'unauthorized', true],
     [403, 'account_frozen', 'account_closed', false],
     [404, undefined, 'misconfigured', true], [404, 'not_found', 'misconfigured', true], [409, undefined, 'misconfigured', true],
-    [404, 'no_account', 'account_closed', false], [409, 'idempotency_conflict', 'bad_request', false],
+    [404, 'no_account', 'account_closed', false], [409, 'idempotency_conflict', 'idempotency_conflict', true],
     [402, undefined, 'insufficient_credits', false], [402, 'insufficient_credits', 'insufficient_credits', false],
     [429, undefined, 'rate_limited', true], [500, undefined, 'provider_down', true], [503, 'whatever', 'provider_down', true],
     [400, undefined, 'bad_request', false], [422, 'mystery', 'bad_request', false], [422, 'below_minimum', 'bad_request', false], [400, 'bad_email', 'bad_request', false],
