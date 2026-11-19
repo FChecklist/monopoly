@@ -54,6 +54,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
   let paid = await paidSum(ctx, company.id, person.id, groupKey);
   const out = { paid: 0, reversed: healed };
+  if (entitled <= paid) await ctx.db.run('DELETE FROM period_block WHERE person_id = ? AND group_key = ?', person.id, groupKey); // whole again
   // v1 (no reversal at the provider): a drop is a DELTA. Rows that were never sent are voided; what was already sent stays and the difference is owed as a correction (no reverse, no re-grant of the whole entitlement).
   let canReverse = false;
   try { canReverse = (await ctx.provider(company).capabilities()).reverse === true; }
@@ -112,7 +113,14 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   if (entitled > paid && !futureOn(ctx.env, company)) {
     // v1: a group with a failed row, or with a re-issue chain (a closed or re-issued row, a ':re<N>' key) is NEVER paid by the settle: only the admin's re-issue (an amount the admin chose) pays it.
     const blk = await ctx.db.first("SELECT state, last_error FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind != 'reversal' AND (state='failed' OR last_error IN ('reissued','closed_partial') OR idem_key GLOB '*:re[0-9]*') ORDER BY created_at DESC LIMIT 1", company.id, person.id, groupKey);
-    if (blk) { out.blocked = 'needs_admin'; if (blk.state === 'failed') out.failedCode = blk.last_error ?? 'failed'; return out; }
+    if (blk) {
+      out.blocked = 'needs_admin'; if (blk.state === 'failed') out.failedCode = blk.last_error ?? 'failed';
+      // The group is underpaid and the clock will not pay it: it is recorded (one audit line when it first happens) and counted in the overview until it is whole.
+      const ins = await ctx.db.run('INSERT OR IGNORE INTO period_block (company_id, person_id, group_key, kind, period_key, entitled, paid, since) VALUES (?,?,?,?,?,?,?,?)', company.id, person.id, groupKey, kind, periodKey ?? null, entitled, paid, ctx.now());
+      if (ins.changes > 0) { try { await commit(ctx, company.id, 'system', 'period.blocked_needs_admin', { group: groupKey, kind, entitled, paid }); } catch { /* the next close */ } }
+      else await ctx.db.run('UPDATE period_block SET entitled = ?, paid = ? WHERE person_id = ? AND group_key = ?', entitled, paid, person.id, groupKey);
+      return out;
+    }
   }
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.

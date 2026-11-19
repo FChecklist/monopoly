@@ -48,6 +48,7 @@ Rewards stay `queued` ("on its way") with the same key and are retried by the ti
 After 24 hours the admin overview shows them. Nothing is ever paid twice.
 
 ## Not enabled in v1
+Buying credits (`startPurchase`, POST /api/admin/buy) is NOT enabled in v1 either (a v2 item): it answers 409 `not_enabled_in_v1` and the provider is not called.
 The shop is NOT enabled in v1 (a v2 item, BOSS decision): `reserveSpend / captureSpend / releaseSpend` are never called; the provider wrapper reports `spend: false`; orders answer 409 `not_enabled_in_v1`. The code and its tests stay for v2.
 Also not enabled in v1 (round 18): topping up a partial grant (refs `<id>:r<k>`), reviving failed rewards (`revive-failed`, `:v<n>`, `:short`, weekly slow retry) and any credit above 500 in one bonus. A failed or partial reward is closed by an admin who checked the ledger and re-issued as a NEW grant (`POST /api/admin/reissue`).
 

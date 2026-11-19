@@ -28,6 +28,11 @@ export const shopOn = (env, company) => futureOn(env, company);
 export function assertShop(env, company) {
   if (!shopOn(env, company)) throw new ApiError(409, 'not_enabled_in_v1', 'The shop is not enabled in v1.');
 }
+/** Buying credits (the provider's purchase page, POST /api/admin/buy) is NOT enabled in v1: a v2 item, gated like the shop. */
+export const buyOn = (env, company) => futureOn(env, company);
+export function assertBuy(env, company) {
+  if (!buyOn(env, company)) throw new ApiError(409, 'not_enabled_in_v1', 'Buying credits is not enabled in v1.');
+}
 /** Capabilities as the game sees them: hold/debit/reverse are false in v1. A real provider that DECLARES them is a configuration error, not something to use. */
 export function v1Caps(env, company, caps, isDemo) {
   if (futureOn(env, company)) return caps;

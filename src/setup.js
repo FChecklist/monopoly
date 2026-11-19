@@ -82,8 +82,15 @@ export async function addTarget(ctx, company, actor, input) {
 }
 
 // ---------- seasons ----------
+/** A dice bonus is one credit: with the strongest rate card its top must not exceed the provider's single maximum. */
+async function assertDiceFits(ctx, company, mode) {
+  if (mode !== 'dice' || company.provider !== 'moneypenny') return;
+  const top = (await ctx.db.first('SELECT MAX(credits) m FROM rate_card WHERE company_id = ?', company.id))?.m ?? 0;
+  assertCreditAmount(company, Math.ceil((top * settingsOf(company).bonus_max_pct) / 100), 'The top of the dice bonus');
+}
 export async function createSeason(ctx, company, actor, { name, starts_at, ends_at, budget, mode }) {
   must(actor, 'admin');
+  await assertDiceFits(ctx, company, mode);
   if (!(ends_at > starts_at)) throw new ApiError(400, 'bad_dates', 'The season must end after it starts.');
   const id = newId('se');
   await commit(ctx, company.id, actor.id, 'season.create', { id, budget }, [['INSERT INTO season (id, company_id, name, starts_at, ends_at, budget, mode, status) VALUES (?,?,?,?,?,?,?, \'draft\')', id, company.id, word(name, 'name', 80), starts_at, ends_at, mustInt(budget, 'budget', { max: 1e9 }), mode === 'dice' ? 'dice' : 'steady']]);
@@ -96,6 +103,7 @@ export async function publishSeason(ctx, company, actor, seasonId, { allowStarte
   if (!s) throw new ApiError(404, 'no_season', 'No draft season with this id.');
   if (s.starts_at <= ctx.now() && !allowStarted) throw new ApiError(409, 'starts_in_past', 'Publish before the start date, so nothing changes under people.');
   const st = settingsOf(company);
+  await assertDiceFits(ctx, company, s.mode);
   if (s.mode === 'dice' && st.bonus_floor_pct < 10) throw new ApiError(409, 'floor', 'Dice mode needs a bonus floor of at least 10 percent.');
   let hold = null, rop = null;
   const prov = ctx.provider(company);

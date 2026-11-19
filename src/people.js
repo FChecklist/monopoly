@@ -235,6 +235,10 @@ export async function resealAll(ctx) {
       email ? await ctx.hash('email', normEmail(email)) : u.email_hash, wid ? await ctx.hash('workid', wid) : null, await redo(u.provider_account_ref, ''), u.id);
     n.people++;
   }
+  for (const r of await ctx.db.all("SELECT id, note FROM reward WHERE json_extract(COALESCE(note, '{}'), '$.acct') IS NOT NULL")) { // the account sealed on a reward row (the first try's account)
+    const nn = JSON.parse(r.note); nn.acct = await ctx.seal(await ctx.unseal(nn.acct, 'reward.acct:' + r.id), 'reward.acct:' + r.id);
+    await ctx.db.run('UPDATE reward SET note = ? WHERE id = ?', JSON.stringify(nn), r.id);
+  }
   const { secretOfKey } = await import('./setup.js');
   for (const k of await ctx.db.all('SELECT * FROM company_key')) {
     await ctx.db.run('UPDATE company_key SET secret_sealed = ? WHERE key_id = ?', await ctx.seal(await secretOfKey(ctx, k), 'company_key.secret:' + k.key_id), k.key_id);

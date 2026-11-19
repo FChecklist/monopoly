@@ -77,3 +77,13 @@ Moneypenny's own default limits are: lifetime 800 credits per person, manual bon
 ## Shop orders (not enabled in v1)
 The shop (hold, capture, release) is NOT enabled in v1: it is a v2 item (BOSS decision). The shop page says it is not available, orders answer 409 not_enabled_in_v1 and the clock does not run order steps.
 Moneypenny holds expire (about 15 minutes plus a grace). An order that is captured after that is refused for good (hold_expired): the order becomes "expired", nobody is charged, and the person orders again. Orders that cannot finish for a day are shown in the overview (open_orders_stuck).
+
+## Environment name
+Set `ENVIRONMENT=production` in a production deployment. The test-only switch FUTURE_OPS (hold, debit, reverse, shop, buying credits) refuses to start when ENVIRONMENT or NODE_ENV starts with "prod"; without the name the guard cannot tell.
+
+## Provider limits to know
+A Moneypenny tenant has a rolling 24-hour bonus cap: a credit refused with cap_reached for that reason may succeed a day later. The game does not retry a refused credit by itself in v1 (the row needs an admin): look at the ledger after 24 hours, then re-issue (with a ledger note) or mark it received.
+Key rotation: a credit whose answer was lost is retried under the same idempotency key. If the Moneypenny key is rotated in between, that key can be answered with idempotency_conflict (shown as a provider problem, retried forever, never paid twice). Empty the queue (nothing "on its way") before rotating; if it happens, check the ledger and use re-issue or mark-received.
+
+## Buying credits (not enabled in v1)
+POST /api/admin/buy (the provider's purchase page) is a v2 item: it answers 409 not_enabled_in_v1 and the admin page says it is not available. The code and its demo-provider tests stay.

@@ -1,5 +1,5 @@
 # Cloudflare Pages project "monopoly" (free tier). Secrets are set with `wrangler pages secret put`, never in this file:
-#   SEAL_KEY, MASTER_SECRET, PLATFORM_TOKEN, ALLOW_DEMO_PROVIDER (demo only), MNP_BASE_URL, MNP_KEY_ID, MNP_SECRET, MNP_COMPANY_ID (the one company the single global key belongs to), MNP_KEYS (JSON per-company keys, instead of the global key), LAZY_TICK
+#   SEAL_KEY, MASTER_SECRET, PLATFORM_TOKEN, ALLOW_DEMO_PROVIDER (demo only), MNP_BASE_URL, MNP_KEY_ID, MNP_SECRET, MNP_COMPANY_ID (the one company the single global key belongs to), MNP_KEYS (JSON per-company keys, instead of the global key), LAZY_TICK, ENVIRONMENT=production (a plain variable: the test-only FUTURE_OPS switch refuses to start in production)
 name = "monopoly"
 compatibility_date = "2026-11-01"
 pages_build_output_dir = "public"

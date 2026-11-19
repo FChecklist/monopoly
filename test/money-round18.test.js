@@ -95,13 +95,13 @@ test('R2 a partial grant is recorded, not topped up by itself; admin routes for 
   const ov = await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal(ov.json.open_partial_grants, 1); assert.ok(ov.json.alerts.some((a) => /Moneypenny ledger/.test(a) && /NEW grant/.test(a)));
   assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id })).status, 400, 'confirm is required');
-  const ok = await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true });
+  const ok = await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' });
   assert.equal(ok.status, 200, JSON.stringify(ok.json));
   const nr = await rowOf(w, ok.json.new_reward);
   assert.equal(nr.state, 'sent'); assert.equal(nr.amount, 200); assert.notEqual(nr.idem_key, r.idem_key);
   r = await rowOf(w, g.reward.id); assert.equal(r.amount, 100); assert.equal(r.last_error, 'closed_partial');
   assert.equal(f.total(A), 300); assert.ok(f.events.has('manual:' + nr.id) && !f.events.has(`manual:${g.reward.id}:r0`), 'a new reference, no :r<k>');
-  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true })).status, 404, 'the closed row cannot be re-issued again');
+  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' })).status, 404, 'the closed row cannot be re-issued again');
   assert.equal(await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='reward.reissued'").then((x) => x.n), 1);
 });
 
@@ -114,7 +114,7 @@ test('R3 a reward the provider refused for good is not retried or revived; re-is
   assert.equal(await openFailedRewards(w.ctx, w.company.id), 1);
   await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id: g.reward.id }), (e) => e.code === 'confirm_required');
   w.f.lifetime = 800;
-  const out = await reissueReward(w.ctx, w.company, 'admin', { id: g.reward.id, confirm: true });
+  const out = await reissueReward(w.ctx, w.company, 'admin', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' });
   const old = await rowOf(w, g.reward.id), nr = await rowOf(w, out.new_reward);
   assert.deepEqual([old.state, old.last_error], ['void', 'reissued']); assert.equal(nr.state, 'sent'); assert.equal(w.f.total(A), 80);
   assert.equal(await openFailedRewards(w.ctx, w.company.id), 0);

@@ -1145,6 +1145,7 @@
       }));
     });
     var buy = panel('Buy ' + unitName(), async function () {
+      if ((await get('/api/admin/overview')).buy !== 'on') return empty('Buying is not available yet.');
       var amt = field('How many ' + unitName() + ' to buy', { type: 'number', min: 100, max: 10000000, required: true, value: '1000' }, 'At least 100. This starts a purchase with the credit provider. This product itself never takes or moves money.');
       var prev = h('p', { 'aria-live': 'polite' }), res = h('div', { 'aria-live': 'polite' });
       function showPrice() { var n = int(amt.ctl.value); prev.replaceChildren(); if (n > 0) prev.appendChild(cur(n)); }

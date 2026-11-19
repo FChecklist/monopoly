@@ -65,7 +65,7 @@ test('S1 re-issue is ONE atomic step: the settle can never pay the group under a
   // a settle that runs at the worst moment: while the batch of the re-issue is being executed, nothing can run in between (one batch)
   const ob = w.db.batch.bind(w.db); let inner = 0;
   w.db.batch = async (stmts) => { const o = await ob(stmts); if (stmts.some((x) => String(x?.[0] ?? x).includes("last_error = 'reissued'"))) { inner++; assert.equal((await w.db.first("SELECT COUNT(*) n FROM reward WHERE kind = 'tier' AND state NOT IN ('void','failed')")).n, 1, 'old row closed AND new row present after the same batch'); } return o; };
-  const out = await reissueReward(w.ctx, w.company, 'admin', { id: row.id, confirm: true });
+  const out = await reissueReward(w.ctx, w.company, 'admin', { id: row.id, confirm: true, note: 'ledger checked, credit not there' });
   w.db.batch = ob; assert.equal(inner, 1);
   assert.equal(out.state, 'sent'); assert.equal(out.paid, 80);
   await days(w, 10, () => ent(w, 80));
@@ -81,7 +81,7 @@ test('S1 a re-issue that cannot place the new grant leaves the old row untouched
   await ent(w, 80); const row = await w.db.first("SELECT id FROM reward WHERE kind = 'tier'");
   const ob = w.db.batch.bind(w.db);
   w.db.batch = async (stmts) => { if (stmts.some((x) => String(x?.[0] ?? x).includes("last_error = 'reissued'"))) throw new Error('audit chain is busy'); return ob(stmts); };
-  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id: row.id, confirm: true }), (e) => ['busy', 'not_reissued'].includes(e.code));
+  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id: row.id, confirm: true, note: 'ledger checked, credit not there' }), (e) => ['busy', 'not_reissued'].includes(e.code));
   w.db.batch = ob;
   const r = await rowOf(w, row.id); assert.deepEqual([r.state, r.reversed, r.last_error], ['failed', 0, 'cap_reached']);
   assert.equal(await openFailedRewards(w.ctx, w.company.id), 1);
@@ -93,7 +93,7 @@ test('S2 a closed partial period row is not topped up by the settle: only the ad
   const id = (await w.db.first("SELECT id FROM reward WHERE kind = 'tier'")).id;
   w.f.lifetime = 800;
   await days(w, 5, () => ent(w, 100)); assert.equal(w.f.credits(), 1, 'no top-up by itself');
-  const out = await reissueReward(w.ctx, w.company, 'admin', { id, confirm: true, amount: 40 });
+  const out = await reissueReward(w.ctx, w.company, 'admin', { id, confirm: true, note: 'ledger checked, credit not there', amount: 40 });
   assert.equal(out.state, 'sent'); assert.equal(w.f.total(A), 70);
   await days(w, 5, () => ent(w, 100)); assert.equal(w.f.total(A), 70, 'the settle still does not pay the remaining 30');
   assert.equal((await tiers(w)).map((x) => x.last_error).sort().join(), 'closed_partial,');
@@ -103,7 +103,7 @@ test('S3 re-issue is refused when live rows already cover the entitlement', asyn
   const w = await mworld({ lifetime: 0 });
   await ent(w, 80); const id = (await w.db.first("SELECT id FROM reward WHERE kind = 'tier'")).id;
   await w.db.run("INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, state, created_at, sent_amount) VALUES ('rw_cover', ?, ?, 'tier', 'tier:t1:W1', 'cover', 80, 'sent', ?, 80)", w.company.id, w.people.a.id, w.clock.t);
-  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id, confirm: true }), (e) => e.code === 'already_covered');
+  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id, confirm: true, note: 'ledger checked, credit not there' }), (e) => e.code === 'already_covered');
   assert.equal((await rowOf(w, id)).state, 'failed');
 });
 
@@ -138,22 +138,22 @@ test('S6 mark-received closes a failed row that really landed, with a note, and 
   assert.equal((await w.call('admin', 'POST', '/api/admin/mark-received', { id: g.reward.id })).status, 400);
   assert.equal((await w.call('admin', 'POST', '/api/admin/mark-received', { id: g.reward.id, confirm: true, note: '' })).status, 400, 'a ledger note is required');
   const ov0 = await w.call('admin', 'GET', '/api/admin/overview'); assert.ok(ov0.json.alerts.some((a) => /mark-received/.test(a) && /reissue/.test(a)));
-  const ok = await w.call('admin', 'POST', '/api/admin/mark-received', { id: g.reward.id, confirm: true, note: 'ledger line 14 Nov, 80 credits' });
+  const ok = await w.call('admin', 'POST', '/api/admin/mark-received', { id: g.reward.id, confirm: true, note: 'ledger line 14 Nov, 80 credits', force: true });
   assert.equal(ok.status, 200, JSON.stringify(ok.json));
   const r = await rowOf(w, g.reward.id); assert.deepEqual([r.state, r.sent_amount, r.last_error], ['sent', 80, null]);
   assert.equal(await openFailedRewards(w.ctx, w.company.id), 0);
   assert.match(r.note, /ledger line 14 Nov/); assert.ok(await w.db.first("SELECT 1 x FROM audit WHERE action = 'reward.marked_received'"), 'an audit line (free text stays on the row)');
-  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true })).status, 404);
+  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' })).status, 404);
   assert.equal(f.credits(), 1);
 });
 
-test('S7 the re-issue answer says the real state: a grant that waits for the budget has paid nothing yet', async () => {
+test('S7 a grant that could only wait for the budget is refused up front (round 20): the old row is untouched', async () => {
   const w = await mworld({ lifetime: 0 }, { budget: 1000 });
   await ent(w, 80); const id = (await w.db.first("SELECT id FROM reward WHERE kind = 'tier'")).id;
   w.f.lifetime = 800;
   await w.db.run('UPDATE season SET budget = 10 WHERE company_id = ?', w.company.id);
-  const out = await reissueReward(w.ctx, w.company, 'admin', { id, confirm: true });
-  assert.equal(out.state, 'waiting'); assert.equal(out.paid, 0);
+  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id, confirm: true, note: 'ledger checked, credit not there' }), (e) => e.code === 'reissue_not_payable');
+  assert.equal((await rowOf(w, id)).state, 'failed');
 });
 
 test('S8 duplicate_ref: the history is read page by page (100 a page, next_before_seq) before it is called unconfirmed', async () => {
