@@ -75,7 +75,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     const reason = 'tier_lost:' + (label ?? kind);
     const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`;
     try {
-      await commit(ctx, company.id, 'system', 'reward.reduce', { person: person.id, group: groupKey, owed: d, entitled }, [
+      await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: d, entitled, delta: true }, [
         ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,NULL,NULL,'recorded',?,?,0)",
           newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), JSON.stringify({ reason, delta: true, owed: d }), ctx.now()],
         ["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", newId('cr'), company.id, person.id, d, reason, ctx.now()],
