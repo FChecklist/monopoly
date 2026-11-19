@@ -81,7 +81,7 @@ async function run({ seed, variant, days = 100 }) {
     for (const [k, v] of rowm) { const [, g] = k.split('|'); const [, et, stg] = g.split(':'); const c = cards.find((x) => x.event_type === et && x.stage === stg); if (c && c.c > 0 && v > c.c) V(`row month cap ${k} ${v}>${c.c}`); }
     // period bonus cap per person/period
     const pbc = new Map();
-    for (const r of rows) { if (!COUNT.has(r.state) || !['tier', 'streak', 'team'].includes(r.kind)) continue; const k = r.person_id + '|' + r.period_key; pbc.set(k, (pbc.get(k) ?? 0) + r.amount); }
+    for (const r of rows) { if (!COUNT.has(r.state) || !(['tier', 'streak', 'team'].includes(r.kind) || (r.kind === 'reversal' && ['tier', 'streak', 'team'].includes(String(r.group_key).split(':')[0])))) continue; const k = r.person_id + '|' + r.period_key; pbc.set(k, (pbc.get(k) ?? 0) + r.amount); }
     for (const [k, v] of pbc) if (v > s.cap_period_bonus_person_period) V(`period bonus cap ${k} ${v}`);
     // (2) events reversed/rejected
     for (const e of await db.all("SELECT * FROM event WHERE company_id=? AND status IN ('reversed','rejected')", cid)) {
