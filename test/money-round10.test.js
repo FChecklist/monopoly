@@ -133,7 +133,9 @@ test('Q3: a credit row that failed after more than one try is not revived by its
   const w = await world(); const real = w.ctx.provider(w.company); let n = 0;
   w.ctx.provider = () => wrap(real, { credit: async (x) => { n++; if (n === 1) { await real.credit(x); throw new ProviderError('provider_down'); } throw new ProviderError('account_closed'); } });
   await entitle(w, 40); await tick(w.ctx, w.company);
-  assert.equal((await w.db.first("SELECT state FROM reward WHERE group_key='tier:t1:W1'")).state, 'failed');
+  assert.equal((await w.db.first("SELECT state FROM reward WHERE group_key='tier:t1:W1'")).state, 'queued', 'a definitive no after a lost reply is not believed at once');
+  for (let i = 0; i < 6; i++) await tick(w.ctx, w.company);
+  assert.equal((await w.db.first("SELECT state FROM reward WHERE group_key='tier:t1:W1'")).state, 'failed', 'after the limit it fails, visibly');
   w.ctx.provider = () => real; w.clock.t += 25 * 3600_000;
   await entitle(w, 40); await tick(w.ctx, w.company);
   assert.equal(await provBal(w), 40, 'not credited a second time');

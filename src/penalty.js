@@ -153,6 +153,11 @@ async function applyPenalty(ctx, company, c0) {
           upd.credits = out.debited; // may be less than asked, never below zero, never spent credits
         } catch (e) {
           if (!(e instanceof ProviderError)) throw e;
+          const transient = e.retriable || (isTransient(e.code) && e.code !== 'unsupported' && e.code !== 'insufficient_credits');
+          if (pend && !transient) { // an earlier try may have landed: a definitive 'no' now is not believed, the case stays pending (retried up to MAX_DEBIT_TRIES, then shown as open_debits_failed)
+            if ((await debitTries(ctx, company, dkey)) < MAX_DEBIT_TRIES) { try { await commit(ctx, company.id, 'system', 'penalty.debit_failed', { id: c.id, key: dkey, code: e.code }); } catch { /* counted next time */ } }
+            return null;
+          }
           if (e.code === 'unsupported' || e.code === 'insufficient_credits') upd.nodebit = e.code; // no debit happened: the case is applied without credits and the reason is on the audit line
           else if (e.retriable || isTransient(e.code)) return null; // may have landed: the marker makes the retry replay it
           else upd.nodebit = e.code; // a definitive refusal
@@ -183,6 +188,15 @@ async function pendingDebit(ctx, company, key) {
   if (!m) return null;
   if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'penalty.debit_resolved' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)) return null;
   try { return JSON.parse(m.data); } catch { return null; }
+}
+const MAX_DEBIT_TRIES = 5;
+const debitTries = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.debit_failed' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n;
+/** Debits that stopped retrying (admin overview: open_debits_failed). */
+export async function openDebitsFailed(ctx, companyId) {
+  const tries = new Map();
+  for (const r of await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.debit_failed'", companyId)) { try { const k = JSON.parse(r.data).key; tries.set(k, (tries.get(k) ?? 0) + 1); } catch { /* skip */ } }
+  let n = 0; for (const [k, t] of tries) if (t >= MAX_DEBIT_TRIES && (await pendingDebit(ctx, { id: companyId }, k))) n++;
+  return n;
 }
 async function resolveDebit(ctx, company, id, key) { try { await commit(ctx, company.id, 'system', 'penalty.debit_resolved', { id, key }); } catch { /* the tick writes it */ } }
 /**

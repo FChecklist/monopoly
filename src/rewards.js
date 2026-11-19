@@ -143,6 +143,7 @@ export async function grant(ctx, company, p) {
 // Codes that describe the provider or its configuration, not this person's account: never a reason to fail a reward for good.
 // insufficient_credits on a CREDIT call can only mean the tenant side is out of funds (API.md has no person-level 402 on /v1/credit): it waits, it never fails the row.
 export const TRANSIENT = new Set([...RETRIABLE_CODES, 'unsupported', 'insufficient_credits']);
+const MAX_AMBIGUOUS_TRIES = 5;
 export const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
 // NOTE: 'cap_reached' (a Moneypenny rule cap) is deliberately PERMANENT for the row (it fails visibly, open_failed_rewards, and an admin can revive it after raising the cap).
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
@@ -177,7 +178,11 @@ export async function sendReward(ctx, company, r) {
       if (r.last_error !== e.code) { try { await commit(ctx, company.id, 'system', 'reward.send_error', { id: r.id, code: e.code }); } catch { /* the next try writes it */ } }
     }
     else if (e.code === 'insufficient_budget' || e.code === 'hold_expired') await backToWaiting(ctx, company, r, e.code);
-    else await failReward(ctx, company, r, e.code);
+    else if (r.attempts > 0 && r.attempts < MAX_AMBIGUOUS_TRIES && (TRANSIENT.has(r.last_error) || String(r.last_error).startsWith('ambiguous_'))) {
+      // An earlier try ended without an answer (it may have landed). A definitive "no" now contradicts that, so it is not believed yet: the row stays queued
+      // and is tried again, up to MAX_AMBIGUOUS_TRIES; only then it fails (visible as open_failed_rewards).
+      await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', 'ambiguous_' + e.code, r.id);
+    } else await failReward(ctx, company, r, e.code);
   }
   return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
 }
@@ -221,8 +226,9 @@ export async function reviveFailedRewards(ctx, company, actor = 'admin') {
   for (const r of await ctx.db.all('SELECT * FROM reward WHERE ' + REVIVABLE + ' ORDER BY created_at', company.id)) {
     const n = JSON.parse(r.note || '{}');
     if ((n.revives ?? 0) >= MAX_REVIVES) continue;
-    const note = JSON.stringify({ ...n, offset: 0, takes: [], revives: (n.revives ?? 0) + 1 });
-    const stmts = [["UPDATE reward SET state='waiting', last_error='revived', sent_amount=amount, note=? WHERE id=? AND state='failed'", note, r.id]];
+    // The first credit may have reached the provider: the revived credit must repeat the SAME amount (same key), so the amount and the takes of the first try are kept.
+    const note = JSON.stringify({ ...n, offset: r.amount - r.sent_amount, takes: [], takes0: n.takes ?? [], sent0: r.sent_amount, revives: (n.revives ?? 0) + 1 });
+    const stmts = [["UPDATE reward SET state='waiting', last_error='revived', note=? WHERE id=? AND state='failed' AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))", note, r.id]];
     const res = await commit(ctx, company.id, actor, 'reward.revived', { id: r.id, was: r.last_error }, stmts, { onlyIfChanged: true });
     if (res[res.length - 1].changes > 0) revived++;
   }
@@ -237,7 +243,7 @@ export async function voidFailedReward(ctx, company, r, reason = 'event_reversed
 
 /** A reverse call is about to go out: leave a marker FIRST (once per row), so a lost answer is finished before the row is trusted as paid. */
 async function markReversePending(ctx, company, r, reason, eventId) {
-  if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0", company.id, `"id":"${r.id}"`)) return;
+  if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0", company.id, `"id":"${r.id}"`)) return true; // an earlier reverse call may have landed
   await commit(ctx, company.id, 'system', 'reward.reverse_pending', { id: r.id, reason: String(reason ?? 'reversal').slice(0, 80), event: eventId ?? null });
 }
 /** Re-run the idempotent reverse (key rev:<entry>) of rows of this group whose reverse call may have been cut short, before anybody counts them as paid. */
@@ -263,6 +269,7 @@ export async function retryQueued(ctx, company, limit = 100) {
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
   }
   await releaseClosedHolds(ctx, company);
+  try { await releasePendingHolds(ctx, company); } catch (e) { if (!(e instanceof ProviderError)) throw e; }
   return { sent, stuck };
 }
 
@@ -270,6 +277,35 @@ export async function retryQueued(ctx, company, limit = 100) {
  * A season closed while some of its rewards were still queued (provider outage) keeps its budget hold, because those rewards draw from it.
  * Once none is queued any more the hold is released and forgotten. Idempotent; a provider problem just leaves it for the next tick.
  */
+/**
+ * Holds that must go back to the company and have not: the OLD hold of a raised budget (season.budget line with 'old'), and a hold that was reserved for a raise
+ * whose commit then failed (season.hold_new that is not the season's hold, older than 10 minutes so a raise in flight is never touched).
+ * Each is released until the provider confirms ('season.hold_freed'); a provider problem just leaves it for the next tick. Returns how many went back.
+ */
+export async function releasePendingHolds(ctx, company) {
+  let freed = 0;
+  const todo = new Map();
+  for (const r of await ctx.db.all("SELECT action, data, at FROM audit WHERE company_id = ? AND action IN ('season.budget','season.hold_new') ORDER BY n", company.id)) {
+    let d; try { d = JSON.parse(r.data); } catch { continue; }
+    if (r.action === 'season.budget' && d.old) todo.set(d.old, { hold: d.old, season: d.id, at: 0 });
+    if (r.action === 'season.hold_new' && d.hold) todo.set(d.hold, { hold: d.hold, season: d.id, at: r.at, orphanCheck: true });
+  }
+  for (const t of todo.values()) {
+    if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'season.hold_freed' AND instr(data, ?) > 0", company.id, `"hold":"${t.hold}"`)) continue;
+    if (t.orphanCheck) {
+      if (ctx.now() - t.at < 600_000) continue;
+      const se = await ctx.db.first('SELECT hold_id FROM season WHERE id = ?', t.season);
+      if (!se || se.hold_id === t.hold) continue;
+    }
+    try {
+      const prov = ctx.provider(company);
+      if ((await prov.capabilities()).hold) await prov.releaseHold({ holdId: t.hold });
+    } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') continue; }
+    await commit(ctx, company.id, 'system', 'season.hold_freed', { id: t.season, hold: t.hold });
+    freed++;
+  }
+  return freed;
+}
 /** Give a closed season's hold back and write the line. Returns the amount, or null while the provider cannot do it (the tick tries again). */
 export async function releaseSeasonHold(ctx, company, se) {
   let amount = 0;
@@ -324,7 +360,7 @@ export async function releaseWaiting(ctx, company) {
       continue;
     }
     if ((await one(ctx, fundedSql, company.id, season.id)) + r.amount > season.budget) continue;
-    const { offset, takes } = NO_TAKE.has(r.kind) ? { offset: 0, takes: [] } : await takesFor(ctx, company, r.person_id, r.amount, s);
+    let { offset, takes } = NO_TAKE.has(r.kind) ? { offset: 0, takes: [] } : n.sent0 != null ? await sameTakes(ctx, n, r) : await takesFor(ctx, company, r.person_id, r.amount, s);
     const guards = [{ sql: "EXISTS (SELECT 1 FROM reward WHERE id=? AND state='waiting')", params: [r.id] }, { sql: `(${fundedSql}) + ? <= ?`, params: [company.id, season.id, r.amount, season.budget] }];
     if (!n.bypass) guards.push({ sql: `(${seasonSql}) + ? <= ?`, params: [...seasonParams, r.amount, seasonCap] });
     guards.push(...takeGuard(takes));
@@ -346,6 +382,15 @@ export async function releaseWaiting(ctx, company) {
   return { moved, voided };
 }
 
+/** A revived row repeats its first amount: the corrections it took then are taken again if they still have room (else the row is sent smaller and they stay open). */
+async function sameTakes(ctx, n, r) {
+  const takes = [];
+  for (const [cid, t] of n.takes0 ?? []) {
+    const c = await ctx.db.first("SELECT amount, recovered FROM correction WHERE id=? AND state='open'", cid);
+    if (c && c.amount - c.recovered >= t) takes.push([cid, t]);
+  }
+  return { offset: r.amount - n.sent0, takes };
+}
 /** Void a waiting row that can never be released. Corrections it had taken go back. No audit line if somebody else got there first. */
 async function voidWaiting(ctx, company, r, n, reason) {
   const live = "EXISTS (SELECT 1 FROM reward WHERE id=? AND state='waiting')";
@@ -386,16 +431,17 @@ export async function reverseReward(ctx, company, r, { reason, actor = 'system',
   }
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id=?', r.person_id);
   let reversed = 0, owed = r.sent_amount ?? r.amount;
+  let earlierTry = false;
   if (r.provider_ref && r.provider_ref !== 'offset') {
     let prov, canReverse;
     // A provider/config problem (unsupported, misconfigured, unauthorized, down) is never permanent for a reversal: the row stays due and the next tick retries.
     try { prov = ctx.provider(company); canReverse = (await prov.capabilities()).reverse; } catch (e) { if (!(e instanceof ProviderError)) throw e; return { reversed: 0, owed: 0, skipped: true, pending: true, code: e.code }; }
     if (canReverse) {
       try {
-        await markReversePending(ctx, company, r, reason, eventId);
+        earlierTry = await markReversePending(ctx, company, r, reason, eventId);
         const out = await prov.reverse({ entryId: r.provider_ref, reasonCode: 'reversal', idem: 'rev:' + r.provider_ref });
         reversed = out.reversed; owed = out.owed ?? Math.max(0, (r.sent_amount ?? r.amount) - reversed);
-      } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.retriable) throw e; }
+      } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.retriable || earlierTry) throw e; } // a definitive 'no' after an earlier try that may have landed is not believed: no owed correction is booked, the next close retries
     }
   } else owed = 0; // fully offset: nothing was ever sent
   const stmts = [

@@ -2,7 +2,7 @@
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
-import { accountRef, retryQueued, releaseSeasonHold } from './rewards.js';
+import { accountRef, retryQueued, releaseSeasonHold, releasePendingHolds } from './rewards.js';
 import { ProviderError } from './provider/errors.js';
 
 const must = (actor, ...roles) => { if (!roles.includes(actor.role)) throw new ApiError(403, 'not_allowed', 'You cannot do this.'); };
@@ -115,12 +115,14 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
     // Only SENT rows have drawn from the hold. A queued row has not (it draws when it is sent), so it stays inside the new hold or it would draw twice.
     const used = (await ctx.db.first("SELECT COALESCE(SUM(sent_amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state='sent'", company.id, s.id)).n;
     const top = s.mode === 'dice' ? Math.ceil(budget * (1 + st.bonus_max_pct / 100)) : budget;
-    const h = await prov.reserveBudget({ amount: Math.max(0, top - used), name: s.name, idem: `hold:${s.id}:${budget}` });
+    const h = await prov.reserveBudget({ amount: Math.max(0, top - used), name: s.name, idem: `hold:${s.id}:${budget}:u${used}` }); // the key carries what was used: a replay is never sized by an older number
     holdId = h.hold_id;
+    // Recorded BEFORE the season row changes: if the commit below fails and the admin retries (maybe at another budget), this hold is found and released by the tick.
+    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold: holdId });
   }
   // The new hold is recorded FIRST; only then the old one goes back. A failed commit can never leave the season on a released hold.
-  await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId }, [['UPDATE season SET budget = ?, hold_id = ? WHERE id = ?', budget, holdId, s.id]]);
-  if (holdId !== s.hold_id && s.hold_id) { try { await prov.releaseHold({ holdId: s.hold_id }); } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
+  await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId, old: holdId !== s.hold_id ? s.hold_id : null }, [['UPDATE season SET budget = ?, hold_id = ? WHERE id = ?', budget, holdId, s.id]]); // 'old' = the hold that must go back; the tick keeps trying until it has
+  await releasePendingHolds(ctx, company);
 }
 export async function closeSeason(ctx, company, actor, seasonId) {
   must(actor, 'admin');
