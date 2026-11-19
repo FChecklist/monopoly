@@ -13,7 +13,7 @@ import { settleCompany, simulateBudget, countFor, tiersOf } from './periods.js';
 import { ProviderError } from './provider/errors.js';
 import { shopOn, buyOn, assertBuy } from './v1.js';
 import { openOps, retryOps } from './provider-ops.js';
-import { makeBudget, budgetLimit, withBudget, BudgetReached } from './budget.js';
+import { makeBudget, budgetLimit, withBudget, BudgetReached, coalescingDb } from './budget.js';
 
 const MAX_BODY = 1_500_000;
 
@@ -345,7 +345,17 @@ route('GET', '/api/admin/seasons', async (c) => { adm(c); return { seasons: awai
 route('POST', '/api/admin/seasons', async (c) => { adm(c); return S.createSeason(c.ctx, c.company, c.user, c.body); });
 route('POST', '/api/admin/seasons/:id/publish', async (c, m) => { adm(c); return S.publishSeason(c.ctx, c.company, c.user, idOf(m)); });
 route('POST', '/api/admin/seasons/:id/budget', async (c, m) => { adm(c); await S.raiseBudget(c.ctx, c.company, c.user, idOf(m), c.body.budget); return R.releaseWaiting(c.ctx, c.company); });
-route('POST', '/api/admin/seasons/:id/close', async (c, m) => { adm(c); await settleCompany(c.ctx, c.company, c.ctx.now(), { force: true }); return S.closeSeason(c.ctx, c.company, c.user, idOf(m)); });
+// The settle that an admin starts ("close now", a season close) is bounded like the clock: one call settles what fits in the invocation and answers { more: true } while work is left; call again until more is false.
+async function settleRoute(c, force) {
+  const lim = budgetLimit(c.ctx.env);
+  if (lim <= 0) return settleCompany(c.ctx, c.company, c.ctx.now(), { force });
+  const inv = Number(c.ctx.env.INVOCATION_QUERY_LIMIT) || 50;
+  const b = makeBudget(Math.max(MIN_DRIVER_BUDGET, Math.min(lim, inv - (c.ctx.budget?.used ?? 0) - MARGIN) - 3)), t = withBudget(c.ctx, b);
+  const r = await settleCompany(t, c.company, c.ctx.now(), { force });
+  try { await c.ctx.db.run('INSERT INTO tick_state (company_id, settle_cursor) VALUES (?,?) ON CONFLICT (company_id) DO UPDATE SET settle_cursor = excluded.settle_cursor', c.company.id, b.settleCursorSet ? (b.settleCursor ?? null) : null); } catch { /* the next call starts again from the top: the finished groups are cheap */ }
+  return { ...r, more: (b.backlog ?? 0) > 0 };
+}
+route('POST', '/api/admin/seasons/:id/close', async (c, m) => { adm(c); const r = await settleRoute(c, true); if (r.more) return { more: true, closed: false }; return S.closeSeason(c.ctx, c.company, c.user, idOf(m)); });
 route('POST', '/api/admin/simulate', async (c) => { adm(c); return simulateBudget(c.ctx, c.company, { people: mustInt(c.body.people, 'people', { min: 1, max: 100000 }), perPerson: c.body.per_person ?? {} }); });
 route('POST', '/api/admin/notes', async (c) => { adm(c); await S.addNoteCard(c.ctx, c.company, c.user, c.body); return { ok: true }; });
 route('GET', '/api/admin/notes', async (c) => { adm(c); return { cards: await c.ctx.db.all('SELECT * FROM note_card WHERE company_id = ? ORDER BY order_no', c.company.id) }; });
@@ -406,64 +416,73 @@ route('POST', '/api/admin/buy', async (c) => {
   try { return await prov.startPurchase({ accountRef: await R.accountRef(c.ctx, c.company, c.user), credits: mustInt(c.body.credits, 'credits', { min: 100, max: 10_000_000 }), ref: 'buy:' + c.ctx.now(), idem: 'buy:' + (c.body.request_id ?? c.ctx.now()) }); }
   catch (e) { if (e instanceof ProviderError) throw new ApiError(409, e.code, e.message); throw e; }
 });
-route('POST', '/api/admin/settle', async (c) => { adm(c); return settleCompany(c.ctx, c.company, c.ctx.now(), { force: c.body.force === true }); });
+route('POST', '/api/admin/settle', async (c) => { adm(c); return settleRoute(c, c.body.force === true); });
 route('POST', '/api/admin/retry-ops', async (c) => { adm(c); return retryOps(c.ctx, c.company); });
 route('POST', '/api/admin/retry-partials', async (c) => { adm(c); return R.retryPartialsNow(c.ctx, c.company); });
 route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
 route('POST', '/api/admin/reissue', async (c) => { adm(c); return R.reissueReward(c.ctx, c.company, c.user?.id ?? 'admin', { id: c.body?.id, confirm: c.body?.confirm, note: c.body?.note, ...(c.body && Object.hasOwn(c.body, 'amount') ? { amount: c.body.amount } : {}) }); });
 route('GET', '/api/admin/needs-admin', async (c) => { adm(c); return R.needsAdmin(c.ctx, c.company, { limit: c.url?.searchParams?.get('limit') ?? c.query?.limit, offset: c.url?.searchParams?.get('offset') ?? c.query?.offset }); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin', { force: c.body?.force === true }); });
-route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });
+route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company, { driver: true, turn: c.body?.turn ?? null }); });
 route('GET', '/api/admin/audit', async (c) => {
   need(c.user, 'admin', 'hr');
   const limit = clampLimit(c.url.searchParams.get('limit'), 100, 500);
   const hide = c.user.role === 'hr' ? "AND action NOT IN ('board.reset')" : ''; // HR does not see board resets (design 4A.8)
   return { verify: await verifyChain(c.ctx.db, c.company.id), rows: await c.ctx.db.all(`SELECT n, actor, action, data, at FROM audit WHERE company_id = ? ${hide} ORDER BY n DESC LIMIT ?`, c.company.id, limit) };
 });
+const resolveAll = async (obj) => { const keys = Object.keys(obj), vals = await Promise.all(Object.values(obj)); return Object.fromEntries(keys.map((k, i) => [k, vals[i]])); };
 route('GET', '/api/admin/overview', async (c) => {
   need(c.user, 'admin', 'hr');
-  const q = (sql, ...p) => c.ctx.db.first(sql, ...p).then((r) => r.n);
+  // Every read below is started at once on a database that gathers the statements of one round into ONE batch (one batch = ONE query for the per-invocation limit): the whole overview takes a handful of calls.
+  const cx = Object.create(c.ctx); cx.db = coalescingDb(c.ctx.db);
+  const q = (sql, ...p) => cx.db.first(sql, ...p).then((r) => r.n);
   const cid = c.company.id;
-  const lastOk = (await q('SELECT last_tick_ok_at n FROM company WHERE id = ?', cid));
-  const o = {
-    people: await q("SELECT COUNT(*) n FROM app_user WHERE company_id = ? AND status = 'active'", cid),
-    events_pending: await q("SELECT COUNT(*) n FROM event WHERE company_id = ? AND status IN ('pending','held')", cid),
-    rewards_on_the_way: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued'", cid),
-    rewards_waiting_budget: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting'", cid),
-    open_corrections: await q("SELECT COUNT(*) n FROM correction WHERE company_id = ? AND state IN ('open','frozen')", cid),
-    penalties_open: await q("SELECT COUNT(*) n FROM penalty_case WHERE company_id = ? AND state IN ('proposed','pending','appealed')", cid),
-    open_handbacks_failed: await q("SELECT COUNT(*) n FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state = 'failed') >= 5", cid),
-    open_failed_rewards: await R.openFailedRewards(c.ctx, cid),
-    open_restores_failed: await Pen.openRestoresFailed(c.ctx, cid),
-    open_debits_failed: await Pen.openDebitsFailed(c.ctx, cid),
-    open_reverses_failed: await R.openReversesFailed(c.ctx, cid),
+  const o = await resolveAll({
+    last_ok: q('SELECT last_tick_ok_at n FROM company WHERE id = ?', cid),
+    tick_state: cx.db.first('SELECT backlog, sweep_left, backlog_ticks, budget_small FROM tick_state WHERE company_id = ?', cid),
+    stage_errors: cx.db.all('SELECT stage, first_at, last_at, count FROM tick_stage WHERE company_id = ? AND count > 0 ORDER BY first_at', cid),
+    people: q("SELECT COUNT(*) n FROM app_user WHERE company_id = ? AND status = 'active'", cid),
+    events_pending: q("SELECT COUNT(*) n FROM event WHERE company_id = ? AND status IN ('pending','held')", cid),
+    rewards_on_the_way: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued'", cid),
+    rewards_waiting_budget: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting'", cid),
+    open_corrections: q("SELECT COUNT(*) n FROM correction WHERE company_id = ? AND state IN ('open','frozen')", cid),
+    penalties_open: q("SELECT COUNT(*) n FROM penalty_case WHERE company_id = ? AND state IN ('proposed','pending','appealed')", cid),
+    open_handbacks_failed: q("SELECT COUNT(*) n FROM penalty_case p WHERE p.company_id = ? AND p.state = 'reversed' AND p.applied_credits > 0 AND NOT EXISTS (SELECT 1 FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state != 'failed') AND (SELECT COUNT(*) FROM reward r WHERE (r.idem_key = 'penrev:' || p.id OR r.idem_key LIKE 'penrev:' || p.id || ':g%') AND r.state = 'failed') >= 5", cid),
+    open_failed_rewards: R.openFailedRewards(cx, cid),
+    open_restores_failed: Pen.openRestoresFailed(cx, cid),
+    open_debits_failed: Pen.openDebitsFailed(cx, cid),
+    open_reverses_failed: R.openReversesFailed(cx, cid),
     shop: shopOn(c.ctx.env, c.company) ? 'on' : 'not enabled in v1',
     buy: buyOn(c.ctx.env, c.company) ? 'on' : 'not enabled in v1',
-    needs_admin: await (async () => { return (await R.needsAdminCounts(c.ctx, c.company)).total; })(),
-    open_holds_failed: await openOps(c.ctx, cid, ['hold_reserve', 'hold_release', 'order_reserve', 'order_release', 'order_decide']),
-    open_partial_grants: await R.openPartialGrants(c.ctx, cid),
-    open_orders_stuck: await q("SELECT COUNT(*) n FROM provider_op WHERE company_id = ? AND kind IN ('order_reserve','order_decide','order_release') AND settled = 0 AND created_at < ?", cid, c.ctx.now() - 24 * 3600_000) + await q("SELECT COUNT(*) n FROM catalogue_order WHERE company_id = ? AND state = 'reserved' AND created_at < ?", cid, c.ctx.now() - 7 * 24 * 3600_000),
-    open_failed_periods: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND event_id IS NULL AND kind IN ('tier','streak','team') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
-    rewards_voided_silent: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'void' AND last_error IN ('season_closed','no_season','season_cap','person_erased') AND created_at > ? AND (event_id IS NULL OR last_error = 'person_erased')", cid, c.ctx.now() - 30 * DAY), // last 30 days; voided EVENT rewards are in the needs-admin list instead
-    unconfirmed_credits: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND last_error = 'duplicate_unconfirmed' AND reversed = 0 AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
-    ...(await (async () => { const ts = await c.ctx.db.first('SELECT backlog, sweep_left, backlog_ticks, err_stage, err_at FROM tick_state WHERE company_id = ?', cid); return { tick_backlog: ts?.backlog ?? 0, tick_sweep_left: ts?.sweep_left ?? 0, tick_backlog_ticks: ts?.backlog_ticks ?? 0, tick_stage_error: ts && ts.err_at > (lastOk || 0) ? { stage: ts.err_stage, at: ts.err_at } : null }; })()),
-    recent_email_changes: await q("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'person.correct' AND at > ? AND instr(data, '\"email\"') > 0", cid, c.ctx.now() - 30 * DAY), // a changed work e-mail changes who a person is to the provider: the admin can see how many were changed lately (the audit lines name the person)
-    last_tick_at: lastOk || null,
-    tick_stale: (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000,
-    warnings: providerCapWarnings(c.company, (await c.ctx.db.first("SELECT MAX(m) n FROM (SELECT MAX(t.bonus) m FROM tier t JOIN period_target p ON p.id = t.target_id WHERE p.company_id = ? UNION ALL SELECT MAX(bonus) FROM streak WHERE company_id = ?)", cid, cid))?.n ?? 0),
-    rewards_waiting_revived: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting' AND last_error = 'revived'", cid),
-    rewards_stuck: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
-    rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
+    needs_admin: R.needsAdminCounts(cx, c.company).then((x) => x.total),
+    open_holds_failed: openOps(cx, cid, ['hold_reserve', 'hold_release', 'order_reserve', 'order_release', 'order_decide']),
+    open_partial_grants: R.openPartialGrants(cx, cid),
+    open_orders_stuck: Promise.all([q("SELECT COUNT(*) n FROM provider_op WHERE company_id = ? AND kind IN ('order_reserve','order_decide','order_release') AND settled = 0 AND created_at < ?", cid, c.ctx.now() - 24 * 3600_000), q("SELECT COUNT(*) n FROM catalogue_order WHERE company_id = ? AND state = 'reserved' AND created_at < ?", cid, c.ctx.now() - 7 * 24 * 3600_000)]).then(([x, y]) => x + y),
+    open_failed_periods: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND event_id IS NULL AND kind IN ('tier','streak','team') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
+    rewards_voided_silent: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'void' AND last_error IN ('season_closed','no_season','season_cap','person_erased') AND created_at > ? AND (event_id IS NULL OR last_error = 'person_erased')", cid, c.ctx.now() - 30 * DAY), // last 30 days; voided EVENT rewards are in the needs-admin list instead
+    unconfirmed_credits: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND last_error = 'duplicate_unconfirmed' AND reversed = 0 AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
+    recent_email_changes: q("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'person.correct' AND at > ? AND instr(data, '\"email\"') > 0", cid, c.ctx.now() - 30 * DAY), // a changed work e-mail changes who a person is to the provider: the admin can see how many were changed lately (the audit lines name the person)
+    warnings: cx.db.first("SELECT MAX(m) n FROM (SELECT MAX(t.bonus) m FROM tier t JOIN period_target p ON p.id = t.target_id WHERE p.company_id = ? UNION ALL SELECT MAX(bonus) FROM streak WHERE company_id = ?)", cid, cid).then((x) => providerCapWarnings(c.company, x?.n ?? 0)),
+    rewards_waiting_revived: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting' AND last_error = 'revived'", cid),
+    rewards_stuck: q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
+    rights_open: q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
-    season: await c.ctx.db.first("SELECT id, name, budget, ends_at FROM season WHERE company_id = ? AND status = 'published' ORDER BY starts_at DESC LIMIT 1", cid),
-    used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
-  };
+    season: cx.db.first("SELECT id, name, budget, ends_at FROM season WHERE company_id = ? AND status = 'published' ORDER BY starts_at DESC LIMIT 1", cid),
+    used_budget: q("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid),
+  });
+  const ts = o.tick_state; o.tick_backlog = ts?.backlog ?? 0; o.tick_sweep_left = ts?.sweep_left ?? 0; o.tick_backlog_ticks = ts?.backlog_ticks ?? 0;
+  o.tick_budget_small = ts?.budget_small ?? null;
+  o.tick_stage_errors = o.stage_errors.map((x) => ({ stage: x.stage, first_at: x.first_at, at: x.last_at, count: x.count }));
+  o.tick_stage_error = o.tick_stage_errors[0] ? { stage: o.tick_stage_errors[0].stage, at: o.tick_stage_errors[0].at } : null; // the oldest uncleared one
+  const lastOk = o.last_ok; o.last_tick_at = lastOk || null; o.tick_stale = (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000;
+  delete o.tick_state; delete o.stage_errors; delete o.last_ok;
   // One plain line per thing that needs an admin: no code, no names.
   const say = { needs_admin: 'Some rewards need an admin: open "Rewards that need an admin" and check the Moneypenny ledger. A failed or partly granted event reward can be re-issued there as a NEW grant (after you checked the ledger); a period bonus (tier, streak, team) is fixed by hand outside the app in v1. Nothing is paid again by itself. A provider cap such as the daily one may clear within 24 hours.', open_partial_grants: 'A reward was granted only in part (the provider paid less than asked). Check the Moneypenny ledger: an event reward can be re-issued for what is missing; for a period bonus the missing part is added by hand outside the app. Nothing is topped up by itself.', open_failed_periods: 'A period bonus (tier, streak or team) failed or was only partly granted and is blocked: open "Rewards that need an admin", check the Moneypenny ledger and fix it by hand outside the app. Nothing is paid again by itself.', unconfirmed_credits: 'The provider said a credit already exists but could not confirm it. Check the Moneypenny ledger: if the credit landed, record it by hand outside the app; re-issue it only if it did NOT land.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.',   rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
-  if (o.tick_stage_error) o.alerts.push('A step of the clock failed (' + o.tick_stage_error.stage + ', ' + new Date(o.tick_stage_error.at).toISOString().slice(0, 16).replace('T', ' ') + ' UTC) and the clock has not run cleanly since: ask support to look at the audit log (tick.stage_error).');
-  if (o.tick_backlog > 0 && o.tick_backlog_ticks >= 6) o.alerts.push('The clock is behind: ' + o.tick_backlog + ' reward groups are waiting to be checked and have been for ' + o.tick_backlog_ticks + ' runs. Run the clock more often (docs/DEPLOY.md) or raise TICK_QUERY_BUDGET on a paid plan. Nothing is lost; the newest periods are checked first.');
-  if (o.tick_stale) o.alerts.push('Nothing has run the clock for over an hour: set up the scheduler (docs/DEPLOY.md) or open the app regularly.');
+  for (const x of o.tick_stage_errors) o.alerts.push('A step of the clock failed (' + x.stage + ', first ' + new Date(x.first_at).toISOString().slice(0, 16).replace('T', ' ') + ' UTC, ' + x.count + ' time' + (x.count === 1 ? '' : 's') + ') and has not run cleanly since: ask support to look at the audit log (tick.stage_error).');
+  if (o.tick_budget_small) { const [need, have] = o.tick_budget_small.split(':'); o.alerts.push('budget_too_small: one visit of the settle needs about ' + need + ' calls and the budget (TICK_QUERY_BUDGET) is ' + have + ': raise it, or run the clock through the signed tick route (docs/DEPLOY.md) which may use a larger allowance.'); }
+  if (o.tick_backlog > 0 && o.tick_backlog_ticks >= 6) o.alerts.push('The clock is behind: ' + o.tick_backlog + ' reward groups or periods are waiting to be checked and have been for ' + o.tick_backlog_ticks + ' runs. Run the clock more often (docs/DEPLOY.md) or raise TICK_QUERY_BUDGET on a paid plan. Nothing is lost; the newest periods are checked first.');
+  if (o.tick_stale) o.alerts.push('Nothing has run the full clock for over an hour: set up the scheduler (docs/DEPLOY.md). Without it period bonuses and streaks are not paid (opening the app only moves the light steps).');
   o.alerts.push(...o.warnings);
   return o;
 });
@@ -473,67 +492,110 @@ route('GET', '/api/admin/rights', async (c) => { need(c.user, 'admin', 'hr'); re
  * Everything the clock drives. Run (1) by the admin button, (2) by an external scheduler calling the signed POST /api/ingest/tick (docs/DEPLOY.md), and
  * (3) lazily: any signed-in request runs a SMALL tick when none ran for 5 minutes (one winner per window, see lazyTick). Nothing else schedules it.
  */
-export async function tick(ctx, company, { limit = 100, only = null } = {}) {
-  const r = await tickBody(ctx, company, limit, only);
-  // The clock only counts as fully run when no stage failed. A stage that stopped because the per-tick budget ran out is not a failure (its backlog is shown in the overview).
-  if (!r._errors) await ctx.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', ctx.now(), company.id);
+export async function tick(ctx, company, { limit = 100, only = null, lazy = false, driver = false, turn = null } = {}) {
+  const r = await tickBody(ctx, company, limit, only, { lazy, driver, turn });
   delete r._errors;
   return r;
 }
-const LAZY_EVERY = 5 * 60_000;
-/** A signed-in request runs a small tick when the last one is older than 5 minutes. ONE row-claim decides who runs it; a failure never reaches the caller. Not used by signed system calls. */
+const LAZY_EVERY = 5 * 60_000, LAZY_MAX_USED = 12, LAZY_BUDGET = 20;
+/**
+ * A signed-in request may start a TINY tick when none ran for 5 minutes (one winner per window, see the claim). It never settles and never sends: it moves the light stages (releases, approvals, reversals, penalty notices)
+ * inside its own small budget, counted against the invocation the request is already using, and is skipped when the request has already used more than LAZY_MAX_USED calls. The heavy work (sending, the period settle) belongs
+ * to the external driver (docs/DEPLOY.md). A failure never reaches the caller. Not used by signed system calls.
+ */
 export async function lazyTick(ctx, company) {
   if (ctx.env.LAZY_TICK === '0') return false;
+  if (ctx.budget && ctx.budget.used > LAZY_MAX_USED) return false; // this request has used its share already
   const t = ctx.now();
   const claim = await ctx.db.run('UPDATE company SET last_tick_at = ? WHERE id = ? AND last_tick_at <= ?', t, company.id, t - LAZY_EVERY);
   if (claim.changes === 0) return false;
-  try { await tick(ctx, company, { limit: 25 }); } catch (e) { console.error('lazy tick failed', e?.message); }
+  try { await tick(ctx, company, { limit: 25, lazy: true }); } catch (e) { console.error('lazy tick failed', e?.message); }
   return true;
 }
-// The stages of the clock. With a query budget (TICK_QUERY_BUDGET, default 40: one worker invocation on a free D1 plan allows about 50) a tick runs ONE of two turns, so every stage
-// can use a useful share: the core turn (sending, releasing, resuming, reversals, penalties, AI housekeeping) and the settle turn. They alternate; a tick with no budget (0) runs everything.
+// The stages of the clock. A tick under a query budget (TICK_QUERY_BUDGET, default 40; one worker invocation on a free D1 plan allows 50 queries, a batch counts as one) runs ONE of two turns, so every stage
+// gets a useful share: the CORE turn (sending, releases, approvals, reversals, penalties, orders, AI housekeeping) and the SETTLE turn (the period bonuses). They alternate. A tick with no budget (0) runs everything.
+// The core stages start at a different one each time round and each has a minimum share (a stage that cannot use its share gives it on), so none is starved by another.
 const CORE = ['sent', 'released', 'resumed', 'reversals', 'penalties', 'orders', 'ai_resumed', 'purged'];
-const RESERVE = 3; // queries kept for the bookkeeping at the end of a bounded tick
-async function tickBody(ctx, company, limit, only = null) {
-  const limitQ = budgetLimit(ctx.env), bounded = limitQ > 0;
+const LIGHT = ['released', 'resumed', 'reversals', 'penalties', 'sent']; // what a lazy tick may do (sending at most a row or two); never the settle
+const WEIGHT = { sent: 14, released: 5, resumed: 3, reversals: 5, penalties: 5, orders: 4, ai_resumed: 3, purged: 2, settled: 999 };
+const RESERVE = 6;             // calls kept for the bookkeeping at the end of a bounded tick (state, stage state, the clock stamp, one audit line)
+const MARGIN = 4;              // calls of the invocation left unused
+const MIN_DRIVER_BUDGET = 32;  // the signed tick route may use this much even when TICK_QUERY_BUDGET is set lower (one visit of the settle needs about 20)
+const CYCLE_WINDOW = 45 * 60_000; // the clock counts as fully run when BOTH turns ran cleanly within this time
+async function tickBody(ctx, company, limit, only = null, { lazy = false, driver = false, turn: want = null } = {}) {
+  const configured = budgetLimit(ctx.env);
+  let limitQ = configured; const bounded = configured > 0 || lazy;
+  if (bounded) {
+    if (lazy) limitQ = LAZY_BUDGET;
+    else if (driver && limitQ < MIN_DRIVER_BUDGET) limitQ = MIN_DRIVER_BUDGET;
+    const invLimit = Number(ctx.env.INVOCATION_QUERY_LIMIT) || 50;
+    if (ctx.budget) limitQ = Math.max(4, Math.min(limitQ, invLimit - ctx.budget.used - MARGIN)); // what the request itself already used is not available
+  }
   const b = makeBudget(limitQ), t = bounded ? withBudget(ctx, b) : ctx;
   const defs = {
     sent: () => R.retryQueued(t, company, limit), released: () => R.releaseWaiting(t, company), resumed: () => E.resumeApproved(t, company),
     reversals: () => E.processReversals(t, company), penalties: () => Pen.tickPenalties(t, company), settled: () => settleCompany(t, company, ctx.now()),
     orders: () => S.finishOrders(t, company), ai_resumed: () => AI.resumeAiRuns(t, company), purged: () => AI.purgeAiData(t, company),
   };
-  let st = null, seq = 0;
-  if (bounded) { st = await t.db.first('SELECT * FROM tick_state WHERE company_id = ?', company.id).catch(() => null); seq = st?.tick_seq ?? 0; }
-  const names = only ?? (bounded ? (seq % 2 === 0 ? CORE : ['settled']) : [...CORE.slice(0, 5), 'settled', ...CORE.slice(5)]);
+  let st = null, seq = 0; const stageRow = new Map();
+  if (!lazy) {
+    try { const [s1, s2] = await t.db.reads([['SELECT * FROM tick_state WHERE company_id = ?', company.id], ['SELECT * FROM tick_stage WHERE company_id = ?', company.id]]); st = s1[0] ?? null; for (const r of s2) stageRow.set(r.stage, r); } catch { /* tables missing or the budget: run without state */ }
+    seq = st?.tick_seq ?? 0;
+  }
+  const rot = (list, k) => list.slice(k % list.length).concat(list.slice(0, k % list.length));
+  const pick = want === 'core' || want === 'settle' ? want : (seq % 2 === 0 ? 'core' : 'settle'); // a driver may ask for a turn (the settle turn alone pays fastest); otherwise they alternate
+  const names = only ?? (lazy ? rot(LIGHT, ctx.now() / LAZY_EVERY | 0) : bounded ? (pick === 'core' ? rot(CORE, seq >> 1) : ['settled']) : [...CORE.slice(0, 5), 'settled', ...CORE.slice(5)]);
+  const turn = only ? 'only' : lazy ? 'lazy' : bounded ? pick : 'all';
   const out = {};
-  let errored = 0, errStage = null, budgetHit = false;
+  let errored = 0, budgetHit = false; const ran = [], failed = [];
   for (let i = 0; i < names.length; i++) {
     const name = names[i];
-    if (bounded) { b.cap = Math.max(b.used + 2, limitQ - RESERVE - 2 * (names.length - 1 - i)); b.hit = 0; } // a later stage always keeps a little
+    if (bounded) {
+      const room = limitQ - (lazy ? 2 : RESERVE) - b.used, share = names.length === 1 ? room : Math.max(WEIGHT[name] ?? 4, Math.floor(room / (names.length - i)));
+      b.cap = b.used + Math.min(room, share); b.hit = 0;
+      if (room < 2) { out[name] = { budget: true }; budgetHit = true; continue; } // nothing left for this stage in this tick: it goes first at another
+    }
     try { out[name] = await defs[name](); } catch (e) {
       if (e instanceof BudgetReached) { out[name] = { budget: true }; budgetHit = true; continue; }
-      out[name] = { error: e?.code ?? 'internal' }; errored++; errStage = errStage ?? name;
+      out[name] = { error: e?.code ?? 'internal' }; errored++; failed.push(name);
       try {
         b.cap = limitQ || Infinity;
         if (!(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.stage_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, '"stage":"' + name + '"'))) await commit(t, company.id, 'system', 'tick.stage_error', { stage: name, code: String(e?.code ?? 'internal').slice(0, 40) });
       } catch { /* the next tick writes it */ }
+      continue;
     }
     if (bounded && b.hit > 0) { budgetHit = true; if (out[name] && typeof out[name] === 'object') out[name] = { ...out[name], budget: true }; }
+    ran.push(name);
   }
-  if (bounded) { // bookkeeping: cursor, backlog, the last stage error, one 'budget reached' line a day
+  // The error state is kept PER STAGE: a stage that failed stays flagged until THAT stage runs cleanly again, whichever turn it belongs to.
+  const now = ctx.now(); let open = [...stageRow.values()].filter((r) => r.count > 0).map((r) => r.stage);
+  if (!lazy || errored) {
+    try {
+      b.cap = Math.max(b.cap, limitQ || Infinity); b.hit = 0;
+      for (const name of failed) await t.db.run('INSERT INTO tick_stage (company_id, stage, first_at, last_at, count, ok_at) VALUES (?,?,?,?,1,0) ON CONFLICT (company_id, stage) DO UPDATE SET first_at = CASE WHEN count = 0 THEN excluded.first_at ELSE first_at END, last_at = excluded.last_at, count = count + 1', company.id, name, now, now);
+      for (const name of ran) if (stageRow.get(name)?.count > 0) { await t.db.run('UPDATE tick_stage SET count = 0, ok_at = ? WHERE company_id = ? AND stage = ?', now, company.id, name); open = open.filter((x) => x !== name); }
+      open = [...new Set([...open, ...failed])];
+    } catch { /* the next tick */ }
+  }
+  if (bounded && !lazy && !only) { // bookkeeping: cursor, backlog, when each turn last ran cleanly, one 'budget reached' line a day, and the clock stamp
     try {
       b.cap = limitQ; b.hit = 0;
-      const ranSettle = names.includes('settled') && !out.settled?.error;
+      const ranSettle = turn === 'settle' && !out.settled?.error && !out.settled?.budget_skipped;
       const backlog = ranSettle ? (b.backlog ?? 0) : (st?.backlog ?? 0);
-      if (ranSettle && backlog > 0) budgetHit = true; // groups were left for the next tick: the budget (not an error) is why
+      out.backlog = backlog; // a driver calls again (settle turn) until this is 0
+      if (ranSettle && backlog > 0) budgetHit = true; // work was left for the next turn: the budget (not an error) is why
       const bt = ranSettle ? (backlog > 0 ? (st?.backlog_ticks ?? 0) + 1 : 0) : (st?.backlog_ticks ?? 0);
       const cursor = ranSettle ? (b.settleCursorSet ? (b.settleCursor ?? null) : (st?.settle_cursor ?? null)) : (st?.settle_cursor ?? null);
-      await t.db.run('INSERT INTO tick_state (company_id, tick_seq, settle_cursor, backlog, sweep_left, backlog_ticks, budget_at, err_stage, err_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (company_id) DO UPDATE SET tick_seq = excluded.tick_seq, settle_cursor = excluded.settle_cursor, backlog = excluded.backlog, sweep_left = excluded.sweep_left, backlog_ticks = excluded.backlog_ticks, budget_at = excluded.budget_at, err_stage = excluded.err_stage, err_at = excluded.err_at',
-        company.id, seq + 1, cursor, backlog, ranSettle ? (b.sweepLeft ?? 0) : (st?.sweep_left ?? 0), bt, budgetHit ? ctx.now() : (st?.budget_at ?? 0), errored ? errStage : (st?.err_stage ?? null), errored ? ctx.now() : (st?.err_at ?? 0));
-      if (budgetHit && !(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.budget_reached' AND at > ?", company.id, ctx.now() - DAY))) await commit(t, company.id, 'system', 'tick.budget_reached', { budget: limitQ, backlog });
+      const small = ranSettle ? (configured > 0 && configured < MIN_DRIVER_BUDGET ? MIN_DRIVER_BUDGET + ':' + configured : (b.budgetSmall ?? null)) : (st?.budget_small ?? null);
+      const cleanTurn = errored === 0;
+      const coreOk = turn === 'core' && cleanTurn ? now : (st?.core_ok_at ?? 0), settleOk = turn === 'settle' && cleanTurn ? now : (st?.settle_ok_at ?? 0);
+      await t.db.run('INSERT INTO tick_state (company_id, tick_seq, settle_cursor, backlog, sweep_left, backlog_ticks, budget_at, core_ok_at, settle_ok_at, budget_small) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (company_id) DO UPDATE SET tick_seq = excluded.tick_seq, settle_cursor = excluded.settle_cursor, backlog = excluded.backlog, sweep_left = excluded.sweep_left, backlog_ticks = excluded.backlog_ticks, budget_at = excluded.budget_at, core_ok_at = excluded.core_ok_at, settle_ok_at = excluded.settle_ok_at, budget_small = excluded.budget_small',
+        company.id, seq + 1, cursor, backlog, ranSettle ? (b.sweepLeft ?? 0) : (st?.sweep_left ?? 0), bt, budgetHit ? now : (st?.budget_at ?? 0), coreOk, settleOk, small);
+      if (!open.length && coreOk >= now - CYCLE_WINDOW && settleOk >= now - CYCLE_WINDOW) await t.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', now, company.id); // fully run: both turns clean, no stage flagged
+      if (budgetHit && !(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.budget_reached' AND at > ?", company.id, now - DAY))) await commit(t, company.id, 'system', 'tick.budget_reached', { budget: limitQ, backlog });
     } catch { /* the next tick */ }
-  } else if (errored) {
-    try { await ctx.db.run('INSERT INTO tick_state (company_id, err_stage, err_at) VALUES (?,?,?) ON CONFLICT (company_id) DO UPDATE SET err_stage = excluded.err_stage, err_at = excluded.err_at', company.id, errStage, ctx.now()); } catch { /* the next tick */ }
+  } else if (!bounded && !errored && (only || !open.length)) {
+    try { await ctx.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', now, company.id); } catch { /* the next tick */ }
   }
   out._errors = errored;
   return out;
@@ -545,7 +607,7 @@ const SYS = { id: 'api', role: 'system' };
 const ABOVE = (k) => AI.KEY_CLASSES.slice(AI.KEY_CLASSES.indexOf(k));
 const sysRoutes = [
   ['POST', '/api/ingest/events', ABOVE('event_write'), async (c) => AI.ingestEvents(c.ctx, c.company, SYS, c.body, { allowCancel: true }), 'write', 'ingest.events'],
-  ['POST', '/api/ingest/tick', ABOVE('event_write'), async (c) => tick(c.ctx, c.company), 'write', 'ingest.tick'],
+  ['POST', '/api/ingest/tick', ABOVE('event_write'), async (c) => tick(c.ctx, c.company, { driver: true, turn: c.body?.turn ?? null }), 'write', 'ingest.tick'],
   ['POST', '/api/webhooks/provider', ['provider_webhook'], async (c) => {
     // Stored first, then answered 200. A daily history check repairs anything missed.
     const t = clean(c.body.type, 60);
@@ -565,7 +627,9 @@ export const registeredV1Routes = () => [
 ];
 
 // ---------- entry ----------
-export async function handle(ctx, req, env = {}) {
+export async function handle(ctx0, req, env = {}) {
+  // One request is one worker invocation: its database and provider calls are counted from the first one (the lazy tick and the tick routes size themselves from what is left of the invocation's limit).
+  const ctx = ctx0.budget ? ctx0 : withBudget(ctx0, makeBudget(0));
   const url = new URL(req.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
   try {
@@ -613,7 +677,7 @@ export async function handle(ctx, req, env = {}) {
       const a = await P.authenticate(ctx, c.token);
       if (!a) throw new ApiError(401, 'sign_in', 'Please sign in.');
       c.user = a.user; c.company = a.company;
-      await lazyTick(ctx, a.company);
+      if (!/^[/]api[/]admin[/](tick|settle|seasons)/.test(path)) await lazyTick(ctx, a.company); // the routes that run the clock themselves need the whole invocation
       if (req.method !== 'GET') { // cross-site writes: require our own header, and a same-site Origin when one is sent
         if (req.headers.get('x-floor') !== '1') throw new ApiError(403, 'csrf', 'Missing request header.');
         const o = req.headers.get('origin');

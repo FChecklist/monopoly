@@ -15,6 +15,8 @@ export function openDb(path = ':memory:') {
     async first(sql, ...p) { return raw.prepare(sql).get(...p) ?? null; },
     async all(sql, ...p) { return raw.prepare(sql).all(...p); },
     async run(sql, ...p) { return { changes: Number(raw.prepare(sql).run(...p).changes) }; },
+    /** Several SELECTs in ONE round trip (D1: one batch, which counts as ONE query for the per-invocation limit). stmts: array of [sql, ...params]. Returns an array of row arrays. */
+    async reads(stmts) { return stmts.map(([sql, ...p]) => raw.prepare(sql).all(...p)); },
     /** stmts: array of [sql, ...params]. Returns array of {changes}. */
     async batch(stmts) {
       const prev = lock;

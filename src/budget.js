@@ -25,15 +25,39 @@ export function budgetDb(db, b) {
     async all(...a) { gate(); return db.all(...a); },
     async run(...a) { gate(); return db.run(...a); },
     async batch(...a) { gate(); return db.batch(...a); },
+    async reads(...a) { gate(); return db.reads(...a); },
     exec: (...a) => db.exec?.(...a),
   };
 }
 /** The same context, with a counted database port. Everything a stage does goes through it. */
 export function withBudget(ctx, b) {
   const t = Object.create(ctx);
-  t.db = budgetDb(ctx.db, b); t.budget = b;
+  t.db = budgetDb(ctx.db, b); t.budget = b; t.rawDb = ctx.rawDb ?? ctx.db;
   // A call to the provider is a subrequest of the same invocation: it counts like a query (and is refused the same way).
-  t.provider = (company) => new Proxy(ctx.provider(company), { get(target, k) { const v = Reflect.get(target, k, target); return typeof v === 'function' && k !== 'then' ? (...a) => { b.gate(); return v.apply(target, a); } : v; } });
+  t.provider = (company) => new Proxy(ctx.provider(company), { get(target, k) { const v = Reflect.get(target, k, target); return typeof v === 'function' && k !== 'then' ? (...a) => { b.gate(); b.provCalls = (b.provCalls ?? 0) + 1; if (k === 'credit') b.credits = (b.credits ?? 0) + 1; return v.apply(target, a); } : v; } });
   return t;
 }
 export const budgetLeft = (ctx) => (ctx.budget ? ctx.budget.left() : Infinity);
+
+/**
+ * A READ-ONLY database port that gathers every SELECT started in the same round (the same synchronous stretch of code, e.g. inside one Promise.all) into ONE batch of the underlying port.
+ * D1 counts one batch as one query, so a page that asks for thirty numbers costs a few calls. Anything that is not a SELECT is passed through untouched.
+ */
+export function coalescingDb(db) {
+  let queue = [];
+  const isSelect = (sql) => /^\s*(SELECT|WITH)\b/i.test(sql);
+  const flush = () => {
+    const batch = queue; queue = [];
+    db.reads(batch.map((x) => [x.sql, ...x.p])).then((rs) => batch.forEach((x, i) => x.ok(rs[i])), (e) => batch.forEach((x) => x.fail(e)));
+  };
+  const add = (sql, p) => new Promise((ok, fail) => { if (!queue.length) queueMicrotask(flush); queue.push({ sql, p, ok, fail }); });
+  return {
+    raw: db.raw,
+    first: (sql, ...p) => (isSelect(sql) ? add(sql, p).then((r) => r[0] ?? null) : db.first(sql, ...p)),
+    all: (sql, ...p) => (isSelect(sql) ? add(sql, p) : db.all(sql, ...p)),
+    run: (...a) => db.run(...a),
+    batch: (...a) => db.batch(...a),
+    reads: (...a) => db.reads(...a),
+    exec: (...a) => db.exec?.(...a),
+  };
+}

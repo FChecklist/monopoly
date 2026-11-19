@@ -6,6 +6,7 @@
 // means "someone else got there first": the numbers are read again and the decision is made again.
 import { settingsOf, DEFAULTS } from './config.js';
 import { commit } from './audit.js';
+import { BudgetReached } from './budget.js';
 import { newId, monthKey, dayKey, DAY, ApiError } from './util.js';
 import { ProviderError, RETRIABLE_CODES } from './provider/errors.js';
 import { futureOn, MAX_SINGLE_CREDIT, assertCreditAmount } from './v1.js';
@@ -170,8 +171,10 @@ async function ambiguousTry(ctx, r) {
 export const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)$/.test(String(code));
 // NOTE: 'cap_reached' (a Moneypenny rule cap) is deliberately PERMANENT for the row (it fails visibly, open_failed_rewards, and an admin can revive it after raising the cap).
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
+export const SEND_COST = 9; // queries and provider calls one send needs (the attempt mark, the account, the call, the receipt)
 export async function sendReward(ctx, company, r) {
   if (r.state !== 'queued') return r;
+  if (ctx.budget && !ctx.budget.unlimited && ctx.budget.left() < SEND_COST) throw new BudgetReached(); // checked BEFORE the attempt is counted: a budget cut is never an attempt
   if (r.sent_amount === 0) { // fully taken by a pending correction: nothing to send
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref='offset', sent_at=? WHERE id=? AND state='queued'", ctx.now(), r.id);
     return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
@@ -197,7 +200,7 @@ export async function sendReward(ctx, company, r) {
   if (!noteNow.acct) { try { acctSealed = await ctx.seal(await accountRef(ctx, company, person), 'reward.acct:' + r.id); } catch { /* the call below reports it */ } }
   const marked = await ctx.db.run("UPDATE reward SET attempts = attempts + 1, note = CASE WHEN ? IS NOT NULL AND json_extract(COALESCE(note, '{}'), '$.acct') IS NULL THEN json_set(COALESCE(note, '{}'), '$.acct', ?) ELSE note END WHERE id = ? AND state = 'queued'", acctSealed, acctSealed, r.id);
   if (marked.changes === 0) return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
-  let usedRef = null;
+  let usedRef = null; const credits0 = ctx.budget?.credits ?? 0;
   try {
     let prov;
     try { prov = ctx.provider(company); } catch (e) { // whatever the provider setup says (missing key, bad URL, unknown provider) is OUR configuration: the row waits, it never fails
@@ -211,6 +214,9 @@ export async function sendReward(ctx, company, r) {
     const got = Number.isInteger(res.granted) && res.granted > 0 && res.granted < r.sent_amount ? res.granted : r.sent_amount; // partial grant is recorded as partial
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, sent_amount=?, last_error=? WHERE id=? AND state='queued'", res.entry_id ?? r.idem_key, ctx.now(), got, got < r.sent_amount ? 'partial_grant' : null, r.id);
   } catch (e) {
+    if (e instanceof BudgetReached && (ctx.budget?.credits ?? 0) === credits0) { // cut before the credit call was made: take the attempt back (on the raw port: the budget is spent)
+      try { await (ctx.rawDb ?? ctx.db).run("UPDATE reward SET attempts = MAX(0, attempts - 1) WHERE id = ? AND state = 'queued'", r.id); } catch { /* the row then looks tried once: it is sent with the same key, so nothing is paid twice */ }
+    }
     if (!(e instanceof ProviderError)) throw e;
     if (usedRef && !noteNow.acct && (e.retriable || isTransient(e.code) || e.code === 'duplicate' || true)) { try { await ctx.db.run("UPDATE reward SET note = json_set(COALESCE(note, '{}'), '$.acct', ?) WHERE id = ? AND json_extract(COALESCE(note, '{}'), '$.acct') IS NULL AND state = 'queued'", await ctx.seal(usedRef, 'reward.acct:' + r.id), r.id); } catch { /* the next try stores it */ } }
     if (e.code === 'duplicate') {
@@ -385,7 +391,7 @@ export async function retryQueued(ctx, company, limit = 100) {
   limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 100));
   for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND state='queued' ORDER BY attempts, created_at LIMIT ?", company.id, limit)) { // fewest tries first: a row that can never be sent cannot starve newer ones
     let out;
-    try { out = await sendReward(ctx, company, r); } catch { stuck++; continue; } // one bad row never stops the others (it is tried again at the next tick)
+    try { out = await sendReward(ctx, company, r); } catch (e) { if (e instanceof BudgetReached) throw e; stuck++; continue; } // one bad row never stops the others (it is tried again at the next tick)
     if (out.state === 'sent') sent++;
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
   }

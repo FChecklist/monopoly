@@ -1,13 +1,16 @@
 # TEMPLATE, NOT ACTIVE. Copy to .github/workflows/tick.yml to switch it on (see docs/DEPLOY.md, "The clock").
 # Needs repository secrets TICK_KEY_ID and TICK_SECRET and a repository variable TICK_URL, all added by the owner. No secret lives in this repo.
+# scripts/tick.js POSTs the signed /api/ingest/tick in a loop (every POST is its own worker invocation with its own limit) until nothing is left over: the settle backlog is 0.
 name: tick
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch: {}
+concurrency: { group: tick, cancel-in-progress: false }
 jobs:
   tick:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

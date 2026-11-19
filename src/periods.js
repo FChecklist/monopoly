@@ -66,18 +66,20 @@ export async function settleEntitlement(ctx, company, args) {
   }
   return { ...out, stale: false, skipped: (out.skipped ?? 0) + 1, skipCode: 'busy' }; // still moving: the next run settles it (nothing was paid from an old figure)
 }
-async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label }) {
-  const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
-  let paid = await paidSum(ctx, company.id, person.id, groupKey);
+async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label, fresh = false }) {
+  // fresh: the caller has just read that this person has NO row at all in this group (nothing to heal, nothing paid, nothing failed, nothing to net): the reads that would only confirm that are skipped. It is a hint, never trusted
+  // for money: the cash row is still a guarded INSERT (holds only while the counted total is still 0) under the same idempotency key as the long path, so a row that appeared meanwhile makes it a replay or 'stale'.
+  const healed = fresh ? 0 : await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
+  let paid = fresh ? 0 : await paidSum(ctx, company.id, person.id, groupKey);
   const out = { paid: 0, reversed: healed };
   // v1 (no reversal at the provider): a drop is a DELTA. Rows that were never sent are voided; what was already sent stays and the difference is owed as a correction (no reverse, no re-grant of the whole entitlement).
   let canReverse = false;
-  try { canReverse = (await ctx.provider(company).capabilities()).reverse === true; }
+  if (!fresh) try { canReverse = (await ctx.provider(company).capabilities()).reverse === true; }
   catch (e) { // a provider or configuration fault: a drop stays due and is decided at the next close (never booked as a correction on a guess)
     if (!(e instanceof ProviderError)) throw e;
     if (entitled < paid) { out.skipped = 1; out.skipCode = e.code ?? 'pending'; return out; }
   }
-  if (entitled < paid) {
+  if (!fresh && entitled < paid) {
     // Reverse newest rows first until paid <= entitled. Any overshoot is topped up below.
     const rows = await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=0 AND amount>0 AND kind != 'reversal' AND state IN ('queued','sent','waiting') ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
     for (const r of rows) {
@@ -92,7 +94,7 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
       paid -= r.amount;
     }
   }
-  if (!canReverse && entitled < paid) {
+  if (!fresh && !canReverse && entitled < paid) {
     const d = paid - entitled;
     // Rows granted only in part have a remainder that was never delivered: a drop is taken from that remainder first (it is cut, nothing is owed for it); only the rest is owed. A top-up in flight waits.
     const parts = await ctx.db.all("SELECT id, note, amount, sent_amount FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='sent' AND reversed=0 AND last_error='partial_grant' ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
@@ -122,12 +124,12 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
     } catch (e) { if (!/idem_key/i.test(String(e?.message))) throw e; } // another settle run did the same delta
   }
   // `paid` and the reversal count `gen` come from ONE statement, so the key below never mixes a stale paid with a fresher gen.
-  const snap = await ctx.db.first(`SELECT
+  const snap = fresh ? { paid: 0, gen: 0 } : await ctx.db.first(`SELECT
     (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}) AS paid,
     (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased','voided_erased','reissued'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
   company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
-  if (!futureOn(ctx.env, company)) {
+  if (!fresh && !futureOn(ctx.env, company)) {
     // v1: a group with a failed row, a partly granted row, or a row the system voided and nothing replaced is NEVER paid again by the settle (it may have landed): it shows in the needs-admin list (the SAME predicate: GROUP_BLOCKER),
     // whether or not other rows cover the amount, for as long as something is still owed. Once nothing is owed (entitled <= paid) the figure is 0 and the group leaves the list.
     // "paid" here is what was DELIVERED: a partly granted row counts what the provider granted (and what an admin-visible cut removed), not its full amount. owed = entitled - delivered.
@@ -138,7 +140,7 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
       if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, owed); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app (v1 never tops a group up by itself)
     } else if (missing === 0) await markGroupOwed(ctx, company.id, person.id, groupKey, 0); // never unlist a group that still has an undelivered remainder
   }
-  if (entitled > paid && !canReverse) {
+  if (!fresh && entitled > paid && !canReverse) {
     const nt = await netCorrections(ctx, company, person, groupKey, periodKey, entitled);
     if (nt.busy) { out.skipped = (out.skipped ?? 0) + 1; out.skipCode = 'busy'; return out; } // never fall through to a cash payment on a failed net: this group waits for the next run
     if (nt.stale) { out.stale = true; return out; }
@@ -151,7 +153,7 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
     // `p${paid}` is what is already counted: a capped or partly paid earlier grant moved it, so the next run tops up the rest
     // under a new key; a voided earlier grant did not, so it replays (a void row is never paid a second time).
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
-    const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n * (futureOn(ctx.env, company) ? 1 : 0); // v1: a failed period row is never re-sent by itself (needs an admin) // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
+    const stale = fresh ? 0 : (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n * (futureOn(ctx.env, company) ? 1 : 0); // v1: a failed period row is never re-sent by itself (needs an admin) // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
     const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && await quickRetryDue(ctx, company, person, groupKey) ? `:x${stale}` : '');
     const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system', paidGuard: { paid } });
     if (g.reason === 'stale') { out.stale = true; return out; }
@@ -221,7 +223,7 @@ async function blockedAt(ctx, company, key) {
 export async function safeSettle(ctx, company, report, args) {
   if (args.person?.erased_at) return { paid: 0, reversed: 0 }; // an erased leaver is never paid or settled again
   const key = await keyOf(args);
-  const isReversal = args.entitled < (await paidSum(ctx, company.id, args.person.id, args.groupKey));
+  const isReversal = args.fresh ? false : args.entitled < (await paidSum(ctx, company.id, args.person.id, args.groupKey));
   const at = await blockedAt(ctx, company, key);
   if (!isReversal && at !== null && ctx.now() - at < BLOCK_TTL) { report.blocked = (report.blocked ?? 0) + 1; return { paid: 0, reversed: 0 }; }
   try {
@@ -346,7 +348,7 @@ export async function teamEntitlements(ctx, company, t, tiers, pr, team, s, fina
  * Periods that ended before the target's active_from are never settled (adding a target later pays nothing for the past).
  */
 export async function settleCompany(ctx, company, asOf = ctx.now(), { force = false } = {}) {
-  if (ctx.budget && !ctx.budget.unlimited && !force) return settleBounded(ctx, company, asOf); // the clock runs under a per-tick query budget: cursor, fingerprints, backlog (src/settle_bounded.js)
+  if (ctx.budget && !ctx.budget.unlimited) return settleBounded(ctx, company, asOf, { force }); // the clock runs under a per-tick query budget: cursor, fingerprints, backlog (src/settle_bounded.js)
   const s = settingsOf(company);
   const report = { tiers: 0, paid: 0, reversed: 0, streaks: 0, team: 0 };
   const lag = force ? 0 : s.late_close_days * DAY;

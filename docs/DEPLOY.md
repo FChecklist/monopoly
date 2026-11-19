@@ -20,7 +20,7 @@ Do the steps in order and tick them off. Write each id you receive into the roll
 1. `npx wrangler d1 create <database-name>` (use the name in `wrangler.toml`). Copy the printed database id into `wrangler.toml` `database_id`.
 2. Apply the migrations IN ORDER, lowest number first, each exactly once:
    `npx wrangler d1 migrations apply <database-name> --remote`
-   (the files are in `migrations/`, `0001_...` then `0002_...` and so on up to `0009_tick_budget.sql` (new tables tick_state and settle_mark; `0008_idx.sql` is an index only, safe to re-run); apply only that folder to D1).
+   (the files are in `migrations/`, `0001_...` then `0002_...` and so on up to `0010_tick_stages.sql` (new tables and columns only: tick_state, settle_mark, tick_stage; `0008_idx.sql` is an index only, safe to re-run). Apply 0009 and 0010 BEFORE deploying this code; apply only that folder to D1).
 3. Check: `npx wrangler d1 execute <database-name> --remote --command "SELECT name FROM sqlite_master WHERE type='table'"` lists the tables and none is a balance table.
 4. Record the time of the first good backup point (see ROLLBACK.md, time travel).
 
@@ -60,6 +60,11 @@ Never type a value into chat, a file in the repo, or a shell history you share.
 * AI: confirm the kill switch works (Admin > AI access > Switch AI off) and note who may press it
 
 ## The clock (tick): who runs it
+**On the free plan a deploy needs one of the two drivers below.** Period bonuses (tiers, team, streaks) are settled by the clock, and the clock needs more calls than one web request may use (Cloudflare Free: 50 queries per invocation, a D1 batch counts as one; limits verified in docs/STATE.md round 27). A signed-in request only starts a tiny tick (light stages and a row or two of sending, never the settle). Without a driver the overview shows the alert "Nothing has run the full clock for over an hour" and period bonuses and streaks are not paid.
+* DRIVER A (recommended, free): a scheduled GitHub Actions workflow. Copy docs/templates/tick-workflow.yml to .github/workflows/tick.yml (it is disabled where it is and holds no secret; add the secrets TICK_KEY_ID and TICK_SECRET and the variable TICK_URL). It runs scripts/tick.js every 10 minutes: that script POSTs the signed /api/ingest/tick in a LOOP (body {"turn":"core"} until nothing is cut by the budget, then {"turn":"settle"} until the answer says backlog 0). Every POST is its own invocation with its own limit, so the loop pays a whole month end in minutes.
+* DRIVER B (alternative): a Cloudflare Cron Trigger on a tiny separate Worker (cron "*/5 * * * *") that makes the same signed calls in the same loop (keep the secret as a Worker secret, never in the repo). It must loop for the same reason (each fetch from the Worker is a subrequest of the Worker, so loop at most about 40 calls per run on the free plan).
+The tick body accepts {"turn":"core"} or {"turn":"settle"} (default: the two alternate). Details below.
+
 The game does nothing by itself. Retries, releases, reversals, penalty notices and period settlement are all done by one function, tick(). Three ways to run it, use at least one:
 1. Lazy (built in): any signed-in request runs a small tick when none ran for 5 minutes (one winner per window, errors never reach the user). This keeps a company that is used daily moving, nothing to set up. Set LAZY_TICK=0 to switch it off.
 2. External scheduler (recommended for a company that may sit unused): call the signed route POST /api/ingest/tick with an ingest key (CONTRACT/signed-v1.md) every 5 to 15 minutes. scripts/tick.js does the signing: `TICK_URL=https://<host> TICK_KEY_ID=<id> TICK_SECRET=<secret> node scripts/tick.js`.

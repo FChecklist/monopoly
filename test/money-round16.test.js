@@ -140,7 +140,7 @@ test('Y8 X4: a signed-in request runs a small tick when none ran for 5 minutes (
   down = false; w.clock.t += 6 * 60_000;
   const ov = await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal((await w.db.first("SELECT state FROM reward WHERE idem_key='y8'")).state, 'sent', 'the lazy tick sent it');
-  assert.equal(ov.json.last_tick_at, w.clock.t); assert.equal(ov.json.tick_stale, false);
+  assert.equal(ov.json.tick_stale, true, 'round 27: a lazy step is not the full clock (no driver: the alert says so)'); assert.ok(ov.json.alerts.some((x) => /full clock/.test(x)));
   const t1 = (await w.db.first('SELECT last_tick_at t FROM company')).t;
   w.clock.t += 60_000; await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal((await w.db.first('SELECT last_tick_at t FROM company')).t, t1, 'not again inside 5 minutes');
