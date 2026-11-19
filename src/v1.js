@@ -23,10 +23,15 @@ export function assertV1Settings(env, company, patch) {
     throw new ApiError(409, 'not_enabled_in_v1', 'Credit-loss penalties are not enabled in v1 (penalties are points and steps only).');
   }
 }
+/** The shop (reserve a hold, capture, release) is NOT enabled in v1: it is a v2 item. Reachable only where the future abilities are (a demo provider on a non-live company with the test-only switch). */
+export const shopOn = (env, company) => futureOn(env, company);
+export function assertShop(env, company) {
+  if (!shopOn(env, company)) throw new ApiError(409, 'not_enabled_in_v1', 'The shop is not enabled in v1.');
+}
 /** Capabilities as the game sees them: hold/debit/reverse are false in v1. A real provider that DECLARES them is a configuration error, not something to use. */
 export function v1Caps(env, company, caps, isDemo) {
   if (futureOn(env, company)) return caps;
-  const out = { ...caps };
+  const out = { ...caps, spend: false }; // the shop is a v2 item: the game never sees a spend ability in v1
   for (const k of FUTURE_CAPS) {
     if (!caps[k]) continue;
     if (!isDemo) throw Object.assign(new Error(`The provider declares "${k}", which is not enabled in v1.`), { v1: true });

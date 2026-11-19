@@ -1,7 +1,7 @@
 // Companies, teams, people and sign-in. Sign-in is an e-mail code, no passwords. Personal fields are sealed at rest.
 import { ApiError, newId, randomCode, sha256Hex, normEmail, isEmail, clean, MIN, HOUR, DAY, safeEqual } from './util.js';
 import { commit } from './audit.js';
-import { assertV1Settings } from './v1.js';
+import { assertV1Settings, assertCreditAmount } from './v1.js';
 import { settingsOf, DEFAULTS, validateSettings, TOKENS } from './config.js';
 import { ensureBoard } from './board.js';
 
@@ -150,6 +150,10 @@ export async function consentsOf(ctx, user) {
 export async function updateSettings(ctx, company, actor, patch) {
   const cur = JSON.parse(company.settings || '{}');
   assertV1Settings(ctx.env, company, patch);
+  if (company.provider === 'moneypenny' && patch.bonus_max_pct !== undefined && (await ctx.db.first("SELECT 1 x FROM season WHERE company_id = ? AND mode = 'dice'", company.id))) {
+    const top = (await ctx.db.first('SELECT MAX(credits) m FROM rate_card WHERE company_id = ?', company.id))?.m ?? 0;
+    assertCreditAmount(company, Math.ceil((top * Number(patch.bonus_max_pct)) / 100), 'The top of the dice bonus');
+  }
   const next = { ...cur, ...validateSettings(patch) };
   await commit(ctx, company.id, actor.id, 'settings.update', { keys: Object.keys(patch) }, [['UPDATE company SET settings = ? WHERE id = ?', JSON.stringify(next), company.id]]);
   return settingsOf({ settings: JSON.stringify(next) });

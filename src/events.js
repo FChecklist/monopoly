@@ -2,6 +2,7 @@
 import { settingsOf } from './config.js';
 import { commit } from './audit.js';
 import { ApiError, newId, normEmail, DAY, clean, defuse } from './util.js';
+import { MAX_SINGLE_CREDIT } from './v1.js';
 import { grant, reverseReward, seasonAt, capOf, voidFailedReward } from './rewards.js';
 import { moveToken, die, bonusPct } from './board.js';
 import { proposePenalty } from './penalty.js';
@@ -175,7 +176,7 @@ export async function applyEvent(ctx, company, eventId) {
   if (card.mode !== 'team' && card.credits > 0) {
     const dice = season.mode === 'dice';
     // Dice bonus: base and the TOP of the bonus range are reserved together, so the bonus can never be left waiting for budget.
-    const top = dice ? Math.max(1, Math.ceil((card.credits * s.bonus_max_pct) / 100)) : 0;
+    const top = dice ? Math.min(company.provider === 'moneypenny' ? MAX_SINGLE_CREDIT : Infinity, Math.max(1, Math.ceil((card.credits * s.bonus_max_pct) / 100))) : 0; // a dice bonus is one credit: never above the provider's single maximum
     const g = await grant(ctx, company, {
       person, kind: 'event', amount: card.credits, idem: `event:${ev.id}:${ev.stage}`, groupKey: `card:${ev.event_type}:${ev.stage}`,
       at: ev.occurred_at, eventId: ev.id, card, capMonth: card.cap_month, capDay: card.cap_day,

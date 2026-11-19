@@ -11,6 +11,7 @@ import * as R from './rewards.js';
 import * as AI from './aiapi.js';
 import { settleCompany, simulateBudget, countFor, tiersOf } from './periods.js';
 import { ProviderError } from './provider/errors.js';
+import { shopOn } from './v1.js';
 import { openOps, retryOps } from './provider-ops.js';
 
 const MAX_BODY = 1_500_000;
@@ -155,7 +156,7 @@ route('POST', '/api/me/rights', async (c) => {
   return { id };
 });
 route('GET', '/api/me/export', async (c) => personExport(c.ctx, c.company, c.user));
-route('GET', '/api/shop/items', async (c) => ({ items: await c.ctx.db.all('SELECT id, name, credits, needs_approval FROM catalogue_item WHERE company_id = ? AND active = 1', c.company.id) }));
+route('GET', '/api/shop/items', async (c) => (shopOn(c.ctx.env, c.company) ? { enabled: true, items: await c.ctx.db.all('SELECT id, name, credits, needs_approval FROM catalogue_item WHERE company_id = ? AND active = 1', c.company.id) } : { enabled: false, items: [], note: 'The shop is not enabled in v1.' }));
 route('POST', '/api/shop/order', async (c) => S.placeOrder(c.ctx, c.company, c.user, c.body.item_id));
 route('GET', '/api/shop/orders', async (c) => ({ orders: await c.ctx.db.all('SELECT id, item_id, credits, state, created_at FROM catalogue_order WHERE person_id = ? ORDER BY created_at DESC', c.user.id) }));
 
@@ -408,6 +409,7 @@ route('POST', '/api/admin/retry-ops', async (c) => { adm(c); return retryOps(c.c
 route('POST', '/api/admin/retry-partials', async (c) => { adm(c); return R.retryPartialsNow(c.ctx, c.company); });
 route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
 route('POST', '/api/admin/reissue', async (c) => { adm(c); return R.reissueReward(c.ctx, c.company, c.user?.id ?? 'admin', { id: c.body?.id, confirm: c.body?.confirm, amount: c.body?.amount }); });
+route('POST', '/api/admin/mark-received', async (c) => { adm(c); return R.markReceived(c.ctx, c.company, c.user?.id ?? 'admin', { id: c.body?.id, confirm: c.body?.confirm, note: c.body?.note, amount: c.body?.amount }); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin', { force: c.body?.force === true }); });
 route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });
 route('GET', '/api/admin/audit', async (c) => {
@@ -433,10 +435,11 @@ route('GET', '/api/admin/overview', async (c) => {
     open_restores_failed: await Pen.openRestoresFailed(c.ctx, cid),
     open_debits_failed: await Pen.openDebitsFailed(c.ctx, cid),
     open_reverses_failed: await R.openReversesFailed(c.ctx, cid),
+    shop: shopOn(c.ctx.env, c.company) ? 'on' : 'not enabled in v1',
     open_holds_failed: await openOps(c.ctx, cid, ['hold_reserve', 'hold_release', 'order_reserve', 'order_release', 'order_decide']),
     open_partial_grants: await R.openPartialGrants(c.ctx, cid),
     open_orders_stuck: await q("SELECT COUNT(*) n FROM provider_op WHERE company_id = ? AND kind IN ('order_reserve','order_decide','order_release') AND settled = 0 AND created_at < ?", cid, c.ctx.now() - 24 * 3600_000) + await q("SELECT COUNT(*) n FROM catalogue_order WHERE company_id = ? AND state = 'reserved' AND created_at < ?", cid, c.ctx.now() - 7 * 24 * 3600_000),
-    open_failed_periods: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND event_id IS NULL AND kind IN ('tier','streak','team')", cid),
+    open_failed_periods: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND event_id IS NULL AND kind IN ('tier','streak','team') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
     rewards_voided_silent: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'void' AND last_error IN ('season_closed','no_season','season_cap','person_erased','voided_erased')", cid),
     last_tick_at: lastOk || null,
     tick_stale: (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000,
@@ -449,7 +452,7 @@ route('GET', '/api/admin/overview', async (c) => {
     used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
   };
   // One plain line per thing that needs an admin: no code, no names.
-  const say = { open_partial_grants: 'Some credits were granted only in part (the sent amount is recorded). Check the Moneypenny ledger, then re-issue the rest as a NEW grant (reissue, with confirm).', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.',   rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards that did not go through and need an admin. Check the Moneypenny ledger, then re-issue as a NEW grant (reissue, with confirm). Nothing is paid again by itself.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
+  const say = { open_partial_grants: 'Some credits were granted only in part (the sent amount is recorded). Check the Moneypenny ledger, then re-issue the rest as a NEW grant (reissue, with confirm), or use mark-received if the whole credit is there.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.',   rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards that did not go through and need an admin (a provider cap, such as the daily one, may clear within 24 hours). Check the Moneypenny ledger first: if the credit is there, use mark-received (with a note); if not, use reissue (with confirm) to send it as a NEW grant. Nothing is paid again by itself.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
   if (o.tick_stale) o.alerts.push('Nothing has run the clock for over an hour: set up the scheduler (docs/DEPLOY.md) or open the app regularly.');
   o.alerts.push(...o.warnings);

@@ -514,7 +514,9 @@
   function viewShop() {
     var out = [h('h1', { text: 'Shop' })], names = {};
     out.push(panel('Choose something', async function (reload) {
-      var items = (await get('/api/shop/items')).items;
+      var shop = await get('/api/shop/items');
+      if (shop.enabled === false) return empty('The shop is not available yet.');
+      var items = shop.items;
       items.forEach(function (i) { names[i.id] = i.name; });
       if (!items.length) return empty('The shop is empty for now.');
       return h('ul', { 'class': 'list' }, items.map(function (i) {

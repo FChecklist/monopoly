@@ -171,8 +171,8 @@ test('R6 a failed period bonus is not re-sent by the daily settle (v1): one prov
   assert.equal((await w.db.first("SELECT COUNT(*) n FROM reward WHERE kind = 'tier'")).n, 1);
 });
 
-test('R7 a hold that has to go back (declined auto order) is released by the clock until the provider confirms', async () => {
-  const w = await world({ v1: true, settings: { daily_event_limit: 1000 } }); const real = w.ctx.provider(w.company);
+test('R7 FUTURE (the shop is not enabled in v1, see R9) a hold that has to go back (declined auto order) is released by the clock until the provider confirms', async () => {
+  const w = await world({ settings: { daily_event_limit: 1000 } }); const real = w.ctx.provider(w.company);
   await settleEntitlement(w.ctx, w.company, { person: w.people.a, kind: 'tier', groupKey: 'tier:t1:W1', periodKey: 'W1', entitled: 100, at: w.clock.t, label: 'x' });
   const it = await setup.addItem(w.ctx, w.company, w.admin, { name: 'Mug', credits: 30, needs_approval: false });
   let rel = 0, down = true;

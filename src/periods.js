@@ -106,9 +106,14 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   // `paid` and the reversal count `gen` come from ONE statement, so the key below never mixes a stale paid with a fresher gen.
   const snap = await ctx.db.first(`SELECT
     (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}) AS paid,
-    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased','voided_erased'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
+    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased','voided_erased','reissued'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
   company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
+  if (entitled > paid && !futureOn(ctx.env, company)) {
+    // v1: a group with a failed row, or with a re-issue chain (a closed or re-issued row, a ':re<N>' key) is NEVER paid by the settle: only the admin's re-issue (an amount the admin chose) pays it.
+    const blk = await ctx.db.first("SELECT state, last_error FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind != 'reversal' AND (state='failed' OR last_error IN ('reissued','closed_partial') OR idem_key GLOB '*:re[0-9]*') ORDER BY created_at DESC LIMIT 1", company.id, person.id, groupKey);
+    if (blk) { out.blocked = 'needs_admin'; if (blk.state === 'failed') out.failedCode = blk.last_error ?? 'failed'; return out; }
+  }
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.
     // Two settle runs at the same time therefore make the same key, and the second one is a replay.

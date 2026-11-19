@@ -1,5 +1,5 @@
 // Company setup: teams, rate card (versioned), period targets, tiers, streaks, seasons, cards, desks, rules, keys, shop.
-import { assertCreditAmount } from './v1.js';
+import { assertCreditAmount, assertShop, shopOn } from './v1.js';
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
@@ -32,6 +32,7 @@ export async function addRateCard(ctx, company, actor, input) {
   const type = word(input.event_type, 'event_type'), stage = word(input.stage, 'stage', 40);
   const credits = mustInt(input.credits, 'credits', { min: 0, max: 1_000_000 });
   assertCreditAmount(company, credits, 'This reward');
+  if (company.provider === 'moneypenny' && (await ctx.db.first("SELECT 1 x FROM season WHERE company_id = ? AND mode = 'dice'", company.id))) assertCreditAmount(company, Math.ceil((credits * settingsOf(company).bonus_max_pct) / 100), 'The top of the dice bonus on this reward'); // the bonus roll is one credit too
   const row = {
     stage_no: mustInt(input.stage_no ?? 1, 'stage_no', { min: 1, max: 20 }), credits,
     cap_month: mustInt(input.cap_month ?? 0, 'cap_month', { max: 10_000_000 }), cap_day: mustInt(input.cap_day ?? 0, 'cap_day', { max: 10_000_000 }),
@@ -227,11 +228,13 @@ export async function revokeKey(ctx, company, actor, keyId) {
 // ---------- catalogue: credits are spent only through the provider (reserve, capture, release) ----------
 export async function addItem(ctx, company, actor, { name, credits, needs_approval = true }) {
   must(actor, 'admin');
+  assertShop(ctx.env, company);
   const id = newId('it');
   await commit(ctx, company.id, actor.id, 'item.add', { id }, [['INSERT INTO catalogue_item (id, company_id, name, credits, needs_approval) VALUES (?,?,?,?,?)', id, company.id, word(name, 'name', 80), mustInt(credits, 'credits', { min: 1, max: 1e6 }), needs_approval ? 1 : 0]]);
   return { id };
 }
 export async function placeOrder(ctx, company, person, itemId) {
+  assertShop(ctx.env, company);
   const item = await ctx.db.first('SELECT * FROM catalogue_item WHERE id = ? AND company_id = ? AND active = 1', itemId, company.id);
   if (!item) throw new ApiError(404, 'no_item', 'No such item.');
   const id = newId('or');
@@ -267,6 +270,7 @@ async function driveOrder(ctx, company, op, actorId = 'system') {
 /** The tick: finish order decisions that were cut short, and give back a hold reserved for an order that was never recorded. */
 export async function finishOrders(ctx, company) {
   let n = 0;
+  if (!shopOn(ctx.env, company)) return 0; // v2 item: nothing of the shop runs in v1
   for (const op of await unsettled(ctx, company.id, 'order_decide')) {
     // A decision the provider refused (an auto-approved order whose decision was refused): it is not left behind. The order stays 'reserved' (shown to the admin) and a new decision may be made.
     if (op.state === 'refused' && op.last_code !== 'hold_expired' && op.params.accept) {
@@ -314,6 +318,7 @@ export async function declineAutoOrder(ctx, company, actorId, o, op, code) {
 }
 export async function decideOrder(ctx, company, actor, orderId, accept, { auto = false } = {}) {
   must(actor, 'admin', 'hr');
+  assertShop(ctx.env, company);
   const o = await ctx.db.first("SELECT * FROM catalogue_order WHERE id = ? AND company_id = ? AND state = 'reserved'", orderId, company.id);
   if (!o) throw new ApiError(404, 'no_order', 'No order waiting.');
   const state = accept ? 'captured' : 'released';

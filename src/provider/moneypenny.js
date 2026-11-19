@@ -96,9 +96,9 @@ export class MoneypennyProvider {
     const granted = Number.isInteger(json.granted) && json.granted > 0 && json.granted < amount ? json.granted : amount;
     return { entry_id: idem, balance: json.balance ?? null, duplicate: replay, granted, partial: granted < amount };
   }
-  async history({ accountRef, limit = 50 }) {
-    const { json } = await this.#call('GET', `/v1/history?email=${encodeURIComponent(accountRef)}&limit=${limit}`);
-    return { lines: (json.entries ?? json.lines ?? []).map((e) => ({ entry_id: e.id ?? e.seq, kind: e.kind, amount: e.delta, ref: e.ref ?? e.ext_ref, at: e.at })) };
+  async history({ accountRef, limit = 50, beforeSeq = null }) {
+    const { json } = await this.#call('GET', `/v1/history?email=${encodeURIComponent(accountRef)}&limit=${Math.min(100, limit)}` + (beforeSeq != null ? `&before_seq=${encodeURIComponent(beforeSeq)}` : ''));
+    return { next_before_seq: json.next_before_seq ?? null, lines: (json.entries ?? json.lines ?? []).map((e) => ({ entry_id: e.id ?? e.seq, kind: e.kind, amount: e.delta, ref: e.ref ?? e.ext_ref, at: e.at })) };
   }
   async reserveSpend({ accountRef, amount, ref, idem, item }) {
     const { json } = await this.#call('POST', '/v1/spend/reserve_item', { email: accountRef, product: this.cfg.product ?? 'floor', item: item ?? ref, order_ref: ref, credits: amount }, idem);
