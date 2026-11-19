@@ -50,8 +50,8 @@ test('W3 v1: hold, debit and reverse are false for the demo provider; a provider
   const caps = await w.ctx.provider(w.company).capabilities();
   assert.equal(caps.hold, false); assert.equal(caps.debit, false); assert.equal(caps.reverse, false);
   assert.throws(() => v1Caps({}, { live: 0 }, { hold: true, debit: false, reverse: false }, false), /not enabled in v1/);
-  assert.equal(v1Caps({ FUTURE_OPS: '1' }, { live: 0 }, { hold: true }, true).hold, true, 'test switch');
-  assert.equal(v1Caps({ FUTURE_OPS: '1' }, { live: 1 }, { hold: true }, true).hold, false, 'never for a live company');
+  assert.equal(v1Caps({ FUTURE_OPS: '1' }, { live: 0, provider: 'stub' }, { hold: true }, true).hold, true, 'test switch');
+  assert.equal(v1Caps({ FUTURE_OPS: '1' }, { live: 1, provider: 'stub' }, { hold: true }, true).hold, false, 'never for a live company');
   assert.equal(v1Caps({ FUTURE_OPS: '1', ENVIRONMENT: 'production' }, { live: 0 }, { hold: true }, true).hold, false, 'never in production');
 });
 

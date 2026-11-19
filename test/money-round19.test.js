@@ -1,5 +1,5 @@
 // Round-19 (credit-only v1): re-issue is ONE atomic step, the settle never pays a group with a failed row or a re-issue chain, dice bonus above 500 is refused/clamped,
-// mark-received, history paging, the account sealed with the attempt, and the shop (spend path) is not enabled in v1.
+// history paging, the account sealed with the attempt, and the shop (spend path) is not enabled in v1. (mark-received, added here, was removed again in round 21.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { world } from './helpers.js';

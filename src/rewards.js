@@ -103,21 +103,25 @@ export async function grant(ctx, company, p) {
     else if (!season) state = 'waiting';
     else {
       funded = await one(ctx, fundedSql, company.id, season.id);
-      if (funded + amount + reserve > season.budget) state = 'waiting';
+      if (funded + amount + reserve - (p.freed | 0) > season.budget) state = 'waiting'; // freed: what the closed old row gives back in the same batch
     }
     if (p.requireQueued && state !== 'queued') return { paid: 0, reason: 'not_payable' }; // a re-issue never creates a row that would only wait
     let offset = 0, takes = [];
     if (state === 'queued' && !NO_TAKE.has(p.kind) && !p.noTake) ({ offset, takes } = await takesFor(ctx, company, p.person.id, amount, s));
 
     const guards = caps.map((c) => ({ sql: `(${c.sql}) + ? <= ?`, params: [...c.params, amount, c.cap] }));
-    if (state === 'queued' && season) guards.push({ sql: `(${fundedSql}) + ? <= ?`, params: [company.id, season.id, amount + reserve, season.budget] });
+    const budgetGuard = state === 'queued' && season ? { sql: `(${fundedSql}) + ? <= ?`, params: [company.id, season.id, amount + reserve, season.budget] } : null;
+    if (budgetGuard) guards.push(budgetGuard);
     guards.push(...takeGuard(takes));
     if (p.alsoGuard) guards.push(p.alsoGuard);
+    if (p.alsoGuardBoth) guards.push(p.alsoGuardBoth); // a condition that must hold for the close AND the insert (person not erased, event still open)
     const id = newId('rw'), sent = amount - offset;
     const noteJson = JSON.stringify({ offset, takes, note: p.note ?? null, at: p.at, bypass: !!p.bypassCaps, periodBonus: !!p.periodBonus });
     const cols = [id, company.id, p.person.id, p.kind, p.groupKey ?? null, p.idem, amount, p.periodKey ?? null, mk, dk, season?.id ?? null, p.eventId ?? null, p.card?.id ?? null, p.card?.version ?? null, state, noteJson, ctx.now(), sent];
     // The statements that close another row ride in the SAME batch and carry the SAME budget/take guards as the insert: if the new row cannot be placed, the old row is not touched.
-    const closeGuards = guards.filter((g) => g !== p.alsoGuard);
+    // The close runs BEFORE the insert, so its budget guard counts what the close itself frees (a partial row gives its missing rest back).
+    const closeGuards = guards.filter((g) => g !== p.alsoGuard && g !== budgetGuard);
+    if (budgetGuard) closeGuards.push({ sql: `(${fundedSql}) + ? <= ?`, params: [company.id, season.id, amount + reserve - (p.freed | 0), season.budget] });
     const alsoStmts = (p.also ?? []).map(([sql, ...prm]) => (closeGuards.length ? [sql + ' AND ' + closeGuards.map((g) => g.sql).join(' AND '), ...prm, ...closeGuards.flatMap((g) => g.params)] : [sql, ...prm]));
     const stmts = [...alsoStmts, [
       `INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, rate_card_id, rate_version, state, note, created_at, sent_amount)
@@ -150,6 +154,8 @@ export async function grant(ctx, company, p) {
 
 // Codes that describe the provider or its configuration, not this person's account: never a reason to fail a reward for good.
 // insufficient_credits on a CREDIT call can only mean the tenant side is out of funds (API.md has no person-level 402 on /v1/credit): it waits, it never fails the row.
+/** Free text and the account reference leave the note of a row of an erased person; the marker that an earlier try may have landed stays. ONE expression for every erase path (people.js uses it too). */
+export const SCRUB_NOTE_SQL = "CASE WHEN attempts > 0 THEN json_set(json_remove(COALESCE(note, '{}'), '$.acct', '$.ledger_note', '$.note', '$.inflight'), '$.maybe_landed', json('true')) ELSE json_remove(COALESCE(note, '{}'), '$.acct', '$.ledger_note', '$.note', '$.inflight') END";
 export const TRANSIENT = new Set([...RETRIABLE_CODES, 'unsupported', 'insufficient_credits']);
 const MAX_AMBIGUOUS_TRIES = 5;
 /** Did an EARLIER try of this row happen (it may have landed)? Re-read now, not from the snapshot: an overlapping tick may have tried it meanwhile. */
@@ -174,7 +180,7 @@ export async function sendReward(ctx, company, r) {
     const own = "EXISTS (SELECT 1 FROM reward WHERE id = ? AND state = 'queued')";
     const st = [];
     for (const [cid, t] of n0.takes ?? []) st.push([`UPDATE correction SET recovered = MAX(0, recovered - ?), state = CASE WHEN state = 'cleared' THEN 'open' ELSE state END WHERE id = ? AND ${own}`, t, cid, r.id]);
-    st.push(["UPDATE reward SET state='void', reversed=1, last_error='voided_erased' WHERE id=? AND state='queued'", r.id]);
+    st.push(["UPDATE reward SET state='void', reversed=1, last_error='voided_erased', note = " + SCRUB_NOTE_SQL + " WHERE id=? AND state='queued'", r.id]);
     await commit(ctx, company.id, 'system', 'reward.void', { orig: r.id, reason: 'voided_erased', maybe_landed: r.attempts > 0 }, st);
     return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
   }
@@ -256,7 +262,7 @@ async function failReward(ctx, company, r, code) {
 const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1 OR (kind IN ('tier','streak','team') AND (SELECT COUNT(*) FROM reward f WHERE f.company_id = reward.company_id AND f.person_id = reward.person_id AND f.group_key = reward.group_key AND f.state = 'failed') >= 3)) AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))"; // a reward of an event that was reversed is never revived // period rows with one try revive themselves under a new key (x<n>) after the block time
 const MAX_REVIVES = 5;
 /** Failed event rewards (and period rows tried more than once) that wait for an admin. Shown as open_failed_rewards in the overview. */
-export const openFailedRewards = async (ctx, companyId) => (futureOn(ctx.env, await ctx.db.first('SELECT live FROM company WHERE id = ?', companyId)) ? (await ctx.db.first('SELECT COUNT(*) n FROM reward WHERE ' + REVIVABLE, companyId)).n : (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND amount > 0 AND kind NOT IN ('reversal','penalty_return') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", companyId)).n);
+export const openFailedRewards = async (ctx, companyId) => (futureOn(ctx.env, await ctx.db.first('SELECT live, provider FROM company WHERE id = ?', companyId)) ? (await ctx.db.first('SELECT COUNT(*) n FROM reward WHERE ' + REVIVABLE, companyId)).n : (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND amount > 0 AND kind NOT IN ('reversal','penalty_return') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", companyId)).n);
 /**
  * Admin helper, like clearBlocked: put every failed event reward back to 'waiting'; releaseWaiting then runs the whole check again and sends it.
  * It keeps the SAME idempotency key (see failReward), so it cannot pay twice. A row is revived at most MAX_REVIVES times.
@@ -368,8 +374,10 @@ export async function retryPartialsNow(ctx, company) {
 export async function retryQueued(ctx, company, limit = 100) {
   let sent = 0, stuck = 0;
   try { // rows of an erased person that are failed or never released are closed for good, with one audit line
-    const er = await ctx.db.all("SELECT id, attempts FROM reward WHERE company_id = ? AND state IN ('failed','waiting') AND amount > 0 AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NOT NULL) LIMIT 200", company.id);
-    if (er.length) await commit(ctx, company.id, 'system', 'reward.void', { reason: 'voided_erased', n: er.length, maybe_landed: er.filter((x) => x.attempts > 0).length }, er.map((x) => ["UPDATE reward SET state = 'void', reversed = 1, last_error = 'voided_erased' WHERE id = ? AND state IN ('failed','waiting')", x.id]));
+    const er = await ctx.db.all("SELECT id, attempts, state FROM reward WHERE company_id = ? AND (state IN ('failed','waiting') OR (state = 'sent' AND last_error = 'partial_grant')) AND amount > 0 AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NOT NULL) LIMIT 200", company.id);
+    if (er.length) await commit(ctx, company.id, 'system', 'reward.void', { reason: 'voided_erased', n: er.length, maybe_landed: er.filter((x) => x.attempts > 0).length }, er.map((x) => (x.state === 'sent' // a partly granted row keeps its amounts and state (the part that landed stays counted): only the reason changes, and the marker says it may have landed
+      ? ["UPDATE reward SET last_error = 'voided_erased', note = json_set(" + SCRUB_NOTE_SQL + ", '$.maybe_landed', json('true')) WHERE id = ? AND state = 'sent' AND last_error = 'partial_grant'", x.id]
+      : ["UPDATE reward SET state = 'void', reversed = 1, last_error = 'voided_erased', note = " + SCRUB_NOTE_SQL + " WHERE id = ? AND state IN ('failed','waiting')", x.id])));
   } catch { /* the next tick */ }
   limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 100));
   for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND state='queued' ORDER BY attempts, created_at LIMIT ?", company.id, limit)) { // fewest tries first: a row that can never be sent cannot starve newer ones
@@ -650,7 +658,11 @@ export async function reissueReward(ctx, company, actor, { id, confirm, amount =
   assertCreditAmount(company, want, 'The new grant');
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
   if (!person || person.erased_at) throw new ApiError(409, 'person_erased', 'This person was erased: nothing is paid.');
-  const live = await ctx.db.first("SELECT COALESCE(SUM(amount),0) s FROM reward WHERE company_id = ? AND event_id = ? AND kind = ? AND id != ? AND state IN ('queued','sent','waiting') AND reversed = 0", company.id, r.event_id, r.kind, r.id);
+  const ev = await ctx.db.first('SELECT status FROM event WHERE id = ? AND company_id = ?', r.event_id, company.id);
+  if (!ev || ['reversal_pending', 'reversed'].includes(ev.status)) throw new ApiError(409, 'event_closed', 'The event behind this reward is being reversed or was reversed: nothing is paid for it.');
+  // Rows of the SAME chain (the root key and its :re<N> follow-ups: the closed_partial row of an earlier try, a voided re-issue) are not "other rewards": they are this reward's own history.
+  const root = String(r.idem_key).replace(/:re\d+$/, '');
+  const live = await ctx.db.first("SELECT COALESCE(SUM(amount),0) s FROM reward WHERE company_id = ? AND event_id = ? AND kind = ? AND id != ? AND state IN ('queued','sent','waiting') AND reversed = 0 AND NOT (idem_key = ? OR substr(idem_key, 1, ?) = ?)", company.id, r.event_id, r.kind, r.id, root, root.length + 3, root + ':re');
   if (live.s > 0 && live.s + delivered >= r.amount - (partial ? (n.offset ?? 0) : 0)) throw new ApiError(409, 'already_covered', 'Other rewards already cover this one: nothing to re-issue.');
   await assertPayableNow(ctx, company, want, partial ? rest : 0);
   const newKey = keyAfter(r.idem_key);
@@ -659,7 +671,7 @@ export async function reissueReward(ctx, company, actor, { id, confirm, amount =
     ? ["UPDATE reward SET amount = ?, last_error = 'closed_partial' WHERE id = ? AND state = 'sent' AND last_error = 'partial_grant' AND reversed = 0", (n.offset ?? 0) + delivered, r.id]
     : ["UPDATE reward SET state = 'void', reversed = 1, last_error = 'reissued' WHERE id = ? AND state = 'failed' AND reversed = 0", r.id];
   const g = await grant(ctx, company, { person, kind: r.kind, amount: want, idem: newKey, groupKey: r.group_key, periodKey: r.period_key, at: ctx.now(), eventId: r.event_id, bypassCaps: true, noTake: true, actor, note: text, requireQueued: true,
-    also: [close], alsoGuard: { sql: 'EXISTS (SELECT 1 FROM reward WHERE id = ? AND last_error = ?)', params: [r.id, marker] }, auditExtra: { reissue_of: r.id, partial, delivered, note_len: text.length } });
+    also: [close], freed: partial ? rest : 0, alsoGuardBoth: { sql: "EXISTS (SELECT 1 FROM app_user WHERE id = ? AND erased_at IS NULL) AND EXISTS (SELECT 1 FROM event WHERE id = ? AND status NOT IN ('reversal_pending','reversed'))", params: [person.id, r.event_id] }, alsoGuard: { sql: 'EXISTS (SELECT 1 FROM reward WHERE id = ? AND last_error = ?)', params: [r.id, marker] }, auditExtra: { reissue_of: r.id, partial, delivered, note_len: text.length } });
   if (g.reason === 'not_payable') throw new ApiError(409, 'reissue_not_payable', 'The new grant could not be queued (no season or no budget right now). Nothing was changed.');
   const nr = g.reward?.id ? await ctx.db.first('SELECT * FROM reward WHERE id = ?', g.reward.id) : null;
   if (!nr || nr.idem_key !== newKey) throw new ApiError(409, g.reason === 'busy' ? 'busy' : 'not_reissued', 'Nothing was changed: ' + (g.reason ?? 'the reward changed meanwhile') + '. Look again.');
@@ -673,13 +685,34 @@ export async function reissueReward(ctx, company, actor, { id, confirm, amount =
 }
 
 /**
- * What needs an admin in v1, derived from the rows (no extra table): failed or partly granted EVENT rewards (can be re-issued), and period groups (tier, streak, team) with a failed row, a partly
- * granted row, or a row the system voided because there was no season / the season closed / the cap was met, that no other row of the group covers (read only: fixed by hand outside the app).
+ * ONE predicate for "this row of a period group blocks the settle": a failed row, a partly granted row, or a row the system voided (no_season, season_closed, season_cap) that no later live row of the group replaces.
+ * Alias x is the row. The settle (periods.js) and the needs-admin list both use it, so what is listed is exactly what is blocked.
+ */
+const blockerSql = (x) => `${x}.kind != 'reversal' AND ${x}.amount > 0 AND (${x}.state = 'failed' OR (${x}.state = 'sent' AND ${x}.last_error = 'partial_grant') OR (${x}.state = 'void' AND ${x}.last_error IN ('no_season','season_closed','season_cap') AND NOT EXISTS (SELECT 1 FROM reward y WHERE y.company_id = ${x}.company_id AND y.person_id = ${x}.person_id AND y.group_key = ${x}.group_key AND y.kind != 'reversal' AND y.state IN ${COUNT} AND y.created_at >= ${x}.created_at AND y.id != ${x}.id)))`;
+export const GROUP_BLOCKER = blockerSql('x');
+/** The latest blocking row of a group, or null. */
+export const groupBlocker = (ctx, companyId, personId, groupKey) => ctx.db.first(`SELECT x.id, x.state, x.last_error FROM reward x WHERE x.company_id = ? AND x.person_id = ? AND x.group_key = ? AND ${GROUP_BLOCKER} ORDER BY x.created_at DESC LIMIT 1`, companyId, personId, groupKey);
+/** The settle tells the list what is still owed: rows that block carry the amount (note.owed); once nothing is owed any more the figure is 0 and the group leaves the list. */
+export async function markGroupOwed(ctx, companyId, personId, groupKey, owed) {
+  if (owed > 0) await ctx.db.run(`UPDATE reward SET note = json_set(COALESCE(note, '{}'), '$.owed', ?) WHERE id IN (SELECT x.id FROM reward x WHERE x.company_id = ? AND x.person_id = ? AND x.group_key = ? AND ${GROUP_BLOCKER})`, owed, companyId, personId, groupKey);
+  else await ctx.db.run("UPDATE reward SET note = json_set(COALESCE(note, '{}'), '$.owed', 0) WHERE company_id = ? AND person_id = ? AND group_key = ? AND kind != 'reversal' AND state IN ('failed','sent','void') AND COALESCE(json_extract(note, '$.owed'), -1) != 0 AND (state = 'failed' OR last_error IN ('partial_grant','no_season','season_closed','season_cap'))", companyId, personId, groupKey);
+}
+
+const NEEDS_LIVE = 'r.person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)';
+/**
+ * What needs an admin in v1, derived from the rows (no extra table), with the REAL totals (no limit):
+ *  events: failed or partly granted EVENT rewards (can be re-issued);
+ *  events_voided: EVENT rewards the system voided (no season, season closed, cap met) in the last 30 days, no live reward replaces them (read only);
+ *  groups: period groups (tier, streak, team) the settle cannot pay because a row of the group blocks it (GROUP_BLOCKER) and something is still owed (read only: fixed by hand outside the app).
  */
 export async function needsAdmin(ctx, company) {
-  const live = "p.id IN (SELECT id FROM app_user WHERE erased_at IS NULL)";
-  const events = await ctx.db.all(`SELECT r.id, r.person_id, r.kind, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at FROM reward r JOIN app_user p ON p.id = r.person_id WHERE r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.reversed = 0 AND r.kind NOT IN ('reversal','penalty_return') AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant')) AND ${live} ORDER BY r.created_at DESC LIMIT 100`, company.id);
-  const groups = await ctx.db.all(`SELECT r.id, r.person_id, r.kind, r.group_key, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at FROM reward r JOIN app_user p ON p.id = r.person_id WHERE r.company_id = ? AND r.event_id IS NULL AND r.kind IN ('tier','streak','team') AND r.amount > 0 AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant') OR (r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap'))) AND ${live}
-    AND (SELECT COALESCE(SUM(x.amount), 0) FROM reward x WHERE x.company_id = r.company_id AND x.person_id = r.person_id AND x.group_key = r.group_key AND x.id != r.id AND x.kind != 'reversal' AND x.state IN ('queued','sent','waiting','recorded')) < r.amount ORDER BY r.created_at DESC LIMIT 100`, company.id);
-  return { events, groups };
+  const cols = 'r.id, r.person_id, r.kind, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at';
+  const events = await ctx.db.all(`SELECT ${cols} FROM reward r WHERE r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.reversed = 0 AND r.kind NOT IN ('reversal','penalty_return') AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant')) AND ${NEEDS_LIVE} ORDER BY r.created_at DESC`, company.id);
+  const events_voided = await ctx.db.all(`SELECT ${cols} FROM reward r WHERE r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap') AND r.created_at > ? AND ${NEEDS_LIVE}
+    AND NOT EXISTS (SELECT 1 FROM reward y WHERE y.company_id = r.company_id AND y.event_id = r.event_id AND y.person_id = r.person_id AND y.kind = r.kind AND y.id != r.id AND y.state IN ${COUNT}) ORDER BY r.created_at DESC`, company.id, ctx.now() - 30 * DAY);
+  const rows = await ctx.db.all(`SELECT ${cols}, r.group_key, json_extract(r.note, '$.owed') AS owed FROM reward r WHERE r.company_id = ? AND r.event_id IS NULL AND r.kind IN ('tier','streak','team') AND ${blockerSql('r')} AND ${NEEDS_LIVE}
+    AND (json_extract(r.note, '$.owed') > 0 OR json_extract(r.note, '$.owed') IS NULL) ORDER BY r.created_at DESC`, company.id);
+  const seen = new Set(), groups = [];
+  for (const g of rows) { const k = g.person_id + '|' + g.group_key; if (seen.has(k)) continue; seen.add(k); groups.push(g); }
+  return { events, events_voided, groups, total: events.length + events_voided.length + groups.length };
 }

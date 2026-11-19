@@ -863,7 +863,8 @@
     return panel('Rewards that need an admin', async function (reload) {
       var d = await get('/api/admin/needs-admin'), who = {};
       try { (await people()).forEach(function (p) { who[p.id] = p.name; }); } catch (e) { /* ids only */ }
-      if (!d.events.length && !d.groups.length) return empty('Nothing needs an admin.');
+      var voided = d.events_voided || [];
+      if (!d.events.length && !d.groups.length && !voided.length) return empty('Nothing needs an admin.');
       var out = [h('p', { 'class': 'muted', text: 'Check the Moneypenny ledger first. Nothing here is paid again by itself.' })];
       if (d.events.length) {
         out.push(h('ul', { 'class': 'list' }, d.events.map(function (x) {
@@ -875,6 +876,14 @@
               var r = await post('/api/admin/reissue', { id: x.id, confirm: true, note: note });
               toast(r.warning ? r.warning : 'Re-issued as a new grant.'); reload();
             }, 'small primary')));
+        })));
+      }
+      if (voided.length) {
+        out.push(h('h3', { text: 'Not paid: no season or a cap was met (read only, last 30 days)' }));
+        out.push(h('ul', { 'class': 'list' }, voided.map(function (x) {
+          return h('li', null, h('b', { text: who[x.person_id] || 'person ' + tail(x.person_id) }), ' ', statusChip('not paid'),
+            h('div', { 'class': 'muted small' }, cur(x.amount), ' | ' + x.kind + ' | ' + (x.reason || '') + ' | ' + when(x.created_at)),
+            h('div', { 'class': 'muted small', text: 'Nothing was sent. If it is still owed, grant it by hand outside the app.' }));
         })));
       }
       if (d.groups.length) {

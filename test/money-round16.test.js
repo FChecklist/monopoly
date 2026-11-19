@@ -197,7 +197,7 @@ test('Y11 X7: a provider that says "duplicate" for a credit has it already: the 
 
 test('Y12 X8/X9: me/rewards shows sent_amount; silent voids are counted; a failed period row is not auto-revived when it was tried more than once', async () => {
   const w = await boot(); await w.login('admin'); await w.login('a');
-  await w.db.run("INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, state, last_error, reversed, created_at, sent_amount) VALUES ('rw_v', ?, ?, 'tier', 'g', 'v1', 10, 'void', 'season_closed', 1, 1, 10)", w.company.id, w.people.a.id);
+  await w.db.run("INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, state, last_error, reversed, created_at, sent_amount) VALUES ('rw_v', ?, ?, 'tier', 'g', 'v1', 10, 'void', 'season_closed', 1, ?, 10)", w.company.id, w.people.a.id, w.clock.t);
   const ov = await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal(ov.json.rewards_voided_silent, 1);
   const real = w.ctx.provider(w.company);

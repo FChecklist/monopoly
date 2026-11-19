@@ -3,7 +3,7 @@
 // A positive difference is paid once (idempotent). A negative one is reversed. So a later cancellation is corrected at the next close.
 import { settingsOf } from './config.js';
 import { futureOn } from './v1.js';
-import { grant, reverseReward, seasonAt, healPendingReverses } from './rewards.js';
+import { grant, reverseReward, seasonAt, healPendingReverses, groupBlocker, markGroupOwed } from './rewards.js';
 import { periodOf, prevPeriod, DAY, sha256Hex, newId, monthKey, dayKey } from './util.js';
 import { commit } from './audit.js';
 import { ProviderError } from './provider/errors.js';
@@ -109,10 +109,13 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased','voided_erased','reissued'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
   company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
-  if (entitled > paid && !futureOn(ctx.env, company)) {
-    // v1: a group with a failed row is NEVER paid again by the settle (it may have landed): it shows in the overview as needing an admin.
-    const blk = await ctx.db.first("SELECT state, last_error FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind != 'reversal' AND state='failed' ORDER BY created_at DESC LIMIT 1", company.id, person.id, groupKey);
-    if (blk) { out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // listed in the overview (needsAdmin), fixed by hand outside the app
+  if (!futureOn(ctx.env, company)) {
+    // v1: a group with a failed row, a partly granted row, or a row the system voided and nothing replaced is NEVER paid again by the settle (it may have landed): it shows in the needs-admin list (the SAME predicate: GROUP_BLOCKER),
+    // whether or not other rows cover the amount, for as long as something is still owed. Once nothing is owed (entitled <= paid) the figure is 0 and the group leaves the list.
+    if (entitled > paid) {
+      const blk = await groupBlocker(ctx, company.id, person.id, groupKey);
+      if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, entitled - paid); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app
+    } else await markGroupOwed(ctx, company.id, person.id, groupKey, 0);
   }
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.

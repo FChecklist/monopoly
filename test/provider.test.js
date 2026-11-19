@@ -196,6 +196,7 @@ test('R10-4: a permanent 400 fails an event reward visibly; the admin revive pay
   assert.equal(await openFailedRewards(w.ctx, w.company.id), 1);
   assert.equal((await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='reward.failed'")).n, 1);
   f.override = null;
+  await w.db.run("UPDATE company SET provider = 'stub'"); await w.reload(); // revive is a FUTURE path: only the demo provider reaches it (the fake server still answers)
   const out = await reviveFailedRewards(w.ctx, w.company);
   assert.equal(out.revived, 1);
   const after = await w.db.first('SELECT state, idem_key FROM reward WHERE id = ?', row.id);

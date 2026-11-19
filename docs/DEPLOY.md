@@ -79,7 +79,7 @@ The shop (hold, capture, release) is NOT enabled in v1: it is a v2 item (BOSS de
 Moneypenny holds expire (about 15 minutes plus a grace). An order that is captured after that is refused for good (hold_expired): the order becomes "expired", nobody is charged, and the person orders again. Orders that cannot finish for a day are shown in the overview (open_orders_stuck).
 
 ## Environment name
-wrangler.toml sets `ENVIRONMENT = "production"` under [vars] (functions/[[path]].js forwards it). Keep it in a production deployment. The test-only switch FUTURE_OPS (hold, debit, reverse, shop, buying credits) refuses to start when ENVIRONMENT or NODE_ENV starts with "prod"; without the name the guard cannot tell.
+wrangler.toml sets `ENVIRONMENT = "production"` under [vars] (functions/[[path]].js forwards it). Keep it in a production deployment. FUTURE_OPS (the test-only switch for hold, debit, reverse, shop, buying credits) is never forwarded by functions/[[path]].js, so a deployed site cannot turn it on; ENVIRONMENT = "production" is set in wrangler.toml and IS forwarded, and the server refuses to start with FUTURE_OPS set when ENVIRONMENT or NODE_ENV starts with "prod". Even where it is set, only a non-live company on the demo provider reaches those paths.
 
 ## Provider limits to know
 A Moneypenny tenant has a rolling 24-hour bonus cap: a credit refused with cap_reached for that reason may succeed a day later. The game does not retry a refused credit by itself in v1 (the row needs an admin): look at the ledger after 24 hours, then re-issue the event reward (with a ledger note); a period bonus is fixed by hand.

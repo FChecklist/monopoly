@@ -5,7 +5,7 @@ import { ApiError } from './util.js';
 
 export const FUTURE_CAPS = ['hold', 'debit', 'reverse'];
 const isProd = (env) => /^prod/i.test(String(env?.ENVIRONMENT ?? env?.NODE_ENV ?? ''));
-export const futureOn = (env, company) => String(env?.FUTURE_OPS) === '1' && !company?.live && !isProd(env);
+export const futureOn = (env, company) => String(env?.FUTURE_OPS) === '1' && !company?.live && company?.provider === 'stub' && !isProd(env); // the demo provider only: a Moneypenny company never reaches hold/debit/reverse/shop/buy, live or not
 
 /** Startup / deploy check: the switch must never be set in a production deployment. */
 export function assertStartup(env) {
