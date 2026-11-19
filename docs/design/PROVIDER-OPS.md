@@ -41,3 +41,8 @@ Reward credit (`sendReward`) keeps its own idempotency key and the `attempts` am
 
 ## For auditors
 To break it you need a path where a provider call is made without an intent row, where a refusal is believed with `tries > 0`, or where a caller recomputes an amount instead of reading `params`.
+
+## v1 status and corrections
+- NOT ENABLED IN v1: hold reserve/release, debit, restore and reverse are forced off (src/v1.js). Only the demo provider with the test-only FUTURE_OPS switch reaches them; the code is kept, unreachable and unaudited. Order reserve/decision (spend) stay live.
+- Round 15: a claim moves the row to 'unknown' at once and carries a token; only the token holder may record the answer and only while the row is open (landed/refused are terminal); a worker whose write changes nothing re-reads and uses the stored state. Exhausted ops in state intended or unknown are surfaced, retried by retry-ops and by the daily slow retry.
+- Correction: a reversal's op is settled right after its commit, not inside it; the replay of the same key makes that safe.

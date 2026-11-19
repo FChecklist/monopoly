@@ -1,3 +1,4 @@
+// FUTURE (not enabled in v1): this file tests hold/debit/reverse paths; it runs with the test-only FUTURE_OPS switch (test/helpers.js).
 // Round-9 money findings from the whole-month simulation (tier net 0 != entitled 40) and the round-8 audit.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

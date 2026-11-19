@@ -46,3 +46,6 @@ the same idempotency key is used on every retry.
 ## If the provider is down
 Rewards stay `queued` ("on its way") with the same key and are retried by the tick (admin button or an `ingest` key call).
 After 24 hours the admin overview shows them. Nothing is ever paid twice.
+
+## Not enabled in v1
+The game does not use hold, debit or reverse in v1 even when a provider declares them: the game forces them to false, and a real provider that declares them true is treated as a configuration error ('not enabled in v1'). Code for them is kept, unreachable and unaudited. Reward credit, balance, spend (shop orders) and purchase links are the v1 surface.

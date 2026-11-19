@@ -131,7 +131,7 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
   }
   // One atomic commit: the season moves UP only (a concurrent raise is never lowered), the new hold is recorded as the season's, and the OLD hold's release is written as an operation the tick keeps replaying.
   const mine = { sql: 'EXISTS (SELECT 1 FROM season WHERE id = ? AND hold_id IS ? AND budget = ?)', params: [s.id, holdId, budget] };
-  const stmts = [["UPDATE season SET budget = ?, hold_id = ? WHERE id = ? AND status = 'published' AND budget <= ?", budget, holdId, s.id, budget]];
+  const stmts = [["UPDATE season SET budget = ?, hold_id = ? WHERE id = ? AND status = 'published' AND budget <= ? AND hold_id IS ?", budget, holdId, s.id, budget, s.hold_id]];
   if (rop) stmts.push([`UPDATE provider_op SET settled = 1 WHERE id = ? AND ${mine.sql}`, rop.id, ...mine.params]);
   if (s.hold_id && holdId !== s.hold_id) stmts.push(intendStmt(ctx, company, { kind: 'hold_release', key: 'hrel:' + s.hold_id, subject: s.id, params: { hold: s.hold_id } }, mine));
   const res = await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId }, stmts, { onlyIf: { sql: 'SELECT 1 FROM season WHERE id = ? AND hold_id IS ? AND budget = ?', params: [s.id, holdId, budget] } });

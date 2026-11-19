@@ -1,3 +1,4 @@
+// FUTURE (not enabled in v1): this file tests hold/debit/reverse paths; it runs with the test-only FUTURE_OPS switch (test/helpers.js).
 // Round-14: ONE outbound provider operation state machine (src/provider-ops.js). Each test runs TWO workers at once (Promise.all) against a provider whose
 // reply is lost (the call lands, the caller sees a timeout) or whose "no" comes before anything landed, and pins that no money is lost, doubled or mis-booked.
 import { test } from 'node:test';

@@ -2,11 +2,20 @@
 import { StubProvider } from './stub.js';
 import { MoneypennyProvider } from './moneypenny.js';
 import { ProviderError } from './errors.js';
+import { v1Caps } from '../v1.js';
 
 export { ProviderError } from './errors.js';
 
 /** env: { MNP_BASE_URL, MNP_KEY_ID, MNP_SECRET, ALLOW_DEMO_PROVIDER }. Secrets come from the environment, never the database. */
+/** The wrapper every provider goes through: hold, debit and reverse are NOT ENABLED in v1 (src/v1.js). */
+function v1(p, env, company, isDemo) {
+  const caps = async () => { try { return v1Caps(env, company, await p.capabilities(), isDemo); } catch (e) { if (e.v1) throw new ProviderError('misconfigured', e.message + ' Not enabled in v1.'); throw e; } };
+  return new Proxy(p, { get: (t, k) => (k === 'capabilities' ? caps : k === 'link' ? async () => ({ ...(await t.link()), capabilities: await caps() }) : typeof t[k] === 'function' ? t[k].bind(t) : t[k]) });
+}
 export function getProvider(env, db, company, opts = {}) {
+  return v1Inner(env, db, company, opts);
+}
+function v1Inner(env, db, company, opts) {
   if (company.provider === 'moneypenny') {
     // One signing key belongs to ONE company. Either a per-company key map (MNP_KEYS = JSON {company_id: {key_id, secret}})
     // or the single global key, which is only usable by the company named in MNP_COMPANY_ID. Never shared across companies.
@@ -21,12 +30,12 @@ export function getProvider(env, db, company, opts = {}) {
       if (!env.MNP_COMPANY_ID || env.MNP_COMPANY_ID !== company.id) throw new ProviderError('unsupported', 'No Moneypenny key is set up for this company.');
       keyId = env.MNP_KEY_ID; secret = env.MNP_SECRET;
     }
-    return new MoneypennyProvider({ baseUrl: env.MNP_BASE_URL, keyId, secret, tenantRef: company.provider_tenant_ref }, opts);
+    return v1(new MoneypennyProvider({ baseUrl: env.MNP_BASE_URL, keyId, secret, tenantRef: company.provider_tenant_ref }, opts), env, company, false);
   }
   if (company.provider === 'stub') {
     if (company.live) throw new ProviderError('unsupported', 'The demo provider is refused for a live company.');
     if (String(env.ALLOW_DEMO_PROVIDER) !== '1') throw new ProviderError('unsupported', 'The demo provider is switched off in this deployment.');
-    return new StubProvider(db, company.id, opts);
+    return v1(new StubProvider(db, company.id, opts), env, company, true);
   }
   throw new ProviderError('unsupported', 'Unknown credit provider.');
 }

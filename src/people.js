@@ -1,12 +1,14 @@
 // Companies, teams, people and sign-in. Sign-in is an e-mail code, no passwords. Personal fields are sealed at rest.
 import { ApiError, newId, randomCode, sha256Hex, normEmail, isEmail, clean, MIN, HOUR, DAY, safeEqual } from './util.js';
 import { commit } from './audit.js';
+import { assertV1Settings } from './v1.js';
 import { settingsOf, DEFAULTS, validateSettings, TOKENS } from './config.js';
 import { ensureBoard } from './board.js';
 
 export const ROLES = ['admin', 'manager', 'hr', 'employee'];
 
 export async function createCompany(ctx, { name, slug, provider = 'stub', adminEmail, adminName = 'Admin', settings = {} }) {
+  assertV1Settings(ctx.env, { live: 0 }, settings);
   slug = String(slug).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40);
   if (!slug || !name) throw new ApiError(400, 'bad_company', 'Name and slug are needed.');
   const id = newId('co');
@@ -147,6 +149,7 @@ export async function consentsOf(ctx, user) {
 
 export async function updateSettings(ctx, company, actor, patch) {
   const cur = JSON.parse(company.settings || '{}');
+  assertV1Settings(ctx.env, company, patch);
   const next = { ...cur, ...validateSettings(patch) };
   await commit(ctx, company.id, actor.id, 'settings.update', { keys: Object.keys(patch) }, [['UPDATE company SET settings = ? WHERE id = ?', JSON.stringify(next), company.id]]);
   return settingsOf({ settings: JSON.stringify(next) });

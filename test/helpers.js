@@ -5,13 +5,13 @@ import { createCompany, addPerson } from '../src/people.js';
 import { createTeam } from '../src/setup.js';
 import * as setup from '../src/setup.js';
 
-export const ENV = { SEAL_KEY: 'test-seal-key-0123456789abcdef-0123456789', MASTER_SECRET: 'test-master-secret-0123456789abcdef-0123456789', ALLOW_DEMO_PROVIDER: '1' };
+export const ENV = { SEAL_KEY: 'test-seal-key-0123456789abcdef-0123456789', MASTER_SECRET: 'test-master-secret-0123456789abcdef-0123456789', ALLOW_DEMO_PROVIDER: '1', FUTURE_OPS: '1' }; // FUTURE_OPS: the test-only switch for the abilities that are NOT ENABLED in v1 (hold, debit, reverse); world({ v1: true }) runs without it
 export const T0 = Date.parse('2026-11-02T10:00:00+05:30'); // a Monday
 
-export async function world({ providerOverride = null, budget = 1_000_000, mode = 'steady', settings = {} } = {}) {
+export async function world({ v1 = false, providerOverride = null, budget = 1_000_000, mode = 'steady', settings = {} } = {}) {
   const db = openDb(); migrate(db); migrateDev(db);
   const clock = { t: T0 - 20 * 86400_000 };
-  const ctx = makeCtx({ db, env: ENV, now: () => clock.t, providerOverride });
+  const ctx = makeCtx({ db, env: v1 ? { ...ENV, FUTURE_OPS: undefined } : ENV, now: () => clock.t, providerOverride });
   const { company, admin } = await createCompany(ctx, { name: 'Acme Test', slug: 'acme', adminEmail: 'boss@acme.test', settings });
   const w = { db, ctx, clock, company, admin, people: {} };
   w.reload = async () => { w.company = await db.first('SELECT * FROM company WHERE id = ?', company.id); return w.company; };

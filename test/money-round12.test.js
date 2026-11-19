@@ -1,3 +1,4 @@
+// FUTURE (not enabled in v1): this file tests hold/debit/reverse paths; it runs with the test-only FUTURE_OPS switch (test/helpers.js).
 // Round-12 money findings (audit 11B). Each test pins one failure.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
