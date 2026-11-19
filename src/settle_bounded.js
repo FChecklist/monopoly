@@ -17,6 +17,13 @@ export const PAY_COST = 20;     // calls a first payment of one member may use (
 export const REVISIT_COST = 12; // calls a member that already has rows may use (settle again, mark)
 export const SCHEDULE_COST = 2; // the schedule batch and the first unit batch: nothing starts with less
 const CHUNK = 12, CHUNK_STATEMENTS = 80, MAX_STREAK_PERIODS = 600;
+// Cold rotation (periods older than the two newest of each target): looked at in rotation, but only a daily quota of them, so a driver run stops when only cold work is left. Every cold period is still seen
+// at least every COLD_SWEEP_DAYS days (the weekly RECHECK of the marks needs that). The quota is kept per UTC day in tick_state (cold_day, cold_used).
+export const COLD_MIN_PER_DAY = 40, COLD_SWEEP_DAYS = 5;
+export const ROWS_READ_SOFT = 3_500_000; // above this many rows read today the settle does hot work only (config: ROWS_READ_SOFT_LIMIT)
+export const rowsSoftLimit = (env) => { const n = Number(env?.ROWS_READ_SOFT_LIMIT); return Number.isFinite(n) && n > 0 ? n : ROWS_READ_SOFT; };
+const STREAK_FULL_EVERY = 24 * 3600_000; // the whole history of a streak target is read again at least once a day, sooner when the recent periods or its rewards changed
+const IST_MS = 19_800_000;
 const RECHECK = 7 * DAY;        // safety net: every member is settled again at least once a week whatever its fingerprint says (a change of events or rewards shows in the fingerprint at once)
 const RETRY_AFTER = 2 * 60_000, RETRY_BLOCKED_AFTER = 6 * 3600_000;
 const COUNT = "('queued','sent','waiting','recorded')";
@@ -27,11 +34,23 @@ const rsig = (r) => (r ? `${r.paid}|${r.c}|${r.ss}|${r.mx}|${r.le}|${r.sa}` : '0
 const cfgOf = (tiers) => tiers.map((x) => `${x.count}:${x.bonus}`).join(',');
 const upper = (prefix) => prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1); // 'a:b:' -> 'a:b;' : an index-friendly range instead of LIKE 'a:b:%'
 
-const holdOf = (sig) => (sig === 'RETRYB' ? RETRY_BLOCKED_AFTER : RETRY_AFTER);
+// The mark of a visit that did not finish cleanly: RETRY:<n>:<fingerprint> (n = consecutive failures: the wait doubles, 2 min up to 6 h, so a member that keeps failing does not eat the budget every turn) or RETRYB:<n>:<fingerprint>
+// (a block in force: 6 h). A CHANGED fingerprint (new events, rewards, tiers, caps) ends the wait at once. The old bare 'RETRY' / 'RETRYB' marks still mean what they meant.
+const RT = /^(RETRYB?):(\d+):/;
+export function retryInfo(mk) {
+  if (!mk) return null;
+  if (mk.sig === 'RETRY' || mk.sig === 'RETRYB') return { tag: mk.sig, n: 1, fp: null };
+  const m = RT.exec(mk.sig);
+  return m ? { tag: m[1], n: Number(m[2]), fp: mk.sig.slice(m[0].length) } : null;
+}
+const holdOf = (info) => (info.tag === 'RETRYB' ? RETRY_BLOCKED_AFTER : Math.min(RETRY_BLOCKED_AFTER, RETRY_AFTER * 2 ** Math.min(10, info.n - 1)));
+// what a cap change must show in: a member held back by a cap is paid again as soon as a cap setting is raised
+export const capsOf = (s) => `c${s.cap_person_month}/${s.cap_person_season}/${s.cap_period_bonus_person_period}/${s.cap_event}`;
 /** What to do with a member: 'same' (up to date), 'wait' (retry hold), 'todo'. */
-function judge(ctx, mk, sig) {
+export function judge(ctx, mk, sig) {
   if (mk && mk.sig === sig && ctx.now() - mk.at < RECHECK) return 'same';
-  if (mk && (mk.sig === 'RETRY' || mk.sig === 'RETRYB') && ctx.now() - mk.at < holdOf(mk.sig)) return 'wait';
+  const info = retryInfo(mk);
+  if (info && ctx.now() - mk.at < holdOf(info) && (info.fp === null || info.fp === sig)) return 'wait'; // a changed fingerprint is not waited for
   return 'todo';
 }
 const retryMark = (ctx, companyId, group, personId, sig) => ctx.db.run('INSERT INTO settle_mark (company_id, group_key, person_id, sig, checked_at) VALUES (?,?,?,?,?) ON CONFLICT (company_id, group_key, person_id) DO UPDATE SET sig = excluded.sig, checked_at = excluded.checked_at', companyId, group, personId, sig, ctx.now());
@@ -73,9 +92,10 @@ function readsOf(company, u, s) {
       ['SELECT group_key g, person_id id, sig, checked_at at FROM settle_mark WHERE company_id = ? AND group_key >= ? AND group_key < ?', company.id, prefix, upper(prefix)],
     ];
   }
-  // streak run of one target: who reached tier 1 in every period (one SELECT per period, all in the same batch), the rewards and the marks of its streaks
+  // streak run of one target: who reached tier 1 in every period. ONE statement (events per person and day, the days are put into periods here), however long the history is; then the rewards and the marks of its streaks
   const out = [];
-  for (const p of m.allPeriods.slice(-MAX_STREAK_PERIODS)) out.push(["SELECT person_id id FROM event WHERE company_id=? AND event_type=? AND stage=? AND status IN ('applied','reversal_pending') AND occurred_at >= ? AND occurred_at < ? GROUP BY person_id HAVING COUNT(*) >= ?", company.id, t.event_type, t.stage, Math.max(p.start, t.active_from ?? 0), p.end, m.tiers[0].count]);
+  const hist = m.allPeriods.slice(-MAX_STREAK_PERIODS);
+  out.push(["SELECT person_id id, (occurred_at + 19800000) / 86400000 d, COUNT(*) n FROM event WHERE company_id=? AND event_type=? AND stage=? AND status IN ('applied','reversal_pending') AND occurred_at >= ? AND occurred_at < ? GROUP BY person_id, d", company.id, t.event_type, t.stage, Math.max(hist[0].start, t.active_from ?? 0), hist[hist.length - 1].end]);
   for (const st of u.streaks) {
     const prefix = `streak:${st.id}:`;
     out.push([`SELECT group_key g, person_id id, ${AGG} FROM reward WHERE company_id = ? AND group_key >= ? AND group_key < ? GROUP BY group_key, person_id`, company.id, prefix, upper(prefix)]);
@@ -84,11 +104,30 @@ function readsOf(company, u, s) {
   return out;
 }
 
+/**
+ * The cheap look at a streak unit (a few statements, whatever the length of its history): the events of the newest closed periods (as many as the longest streak needs, plus two), the streak rewards of those periods,
+ * the streak settings, and the two unit marks. The unit is skipped when this fingerprint is the one of its last clean visit AND the whole history was read within a day.
+ */
+function streakPre(company, u) {
+  const { t, m, streaks } = u, L = Math.max(...streaks.map((x) => x.length), 1), win = m.allPeriods.slice(-(L + 2));
+  const from = Math.max(win[0].start, t.active_from ?? 0), to = win[win.length - 1].end;
+  const stmts = [["SELECT COUNT(*) c, COALESCE(MAX(created_at),0) mx, COALESCE(SUM(occurred_at % 100003),0) sm FROM event WHERE company_id=? AND event_type=? AND stage=? AND status IN ('applied','reversal_pending') AND occurred_at >= ? AND occurred_at < ?", company.id, t.event_type, t.stage, from, to]];
+  for (const st of streaks) { const prefix = `streak:${st.id}:`; stmts.push([`SELECT ${AGG} FROM reward WHERE company_id = ? AND group_key >= ? AND group_key < ?`, company.id, prefix + win[0].key, upper(prefix)]); }
+  stmts.push(['SELECT group_key g, sig, checked_at at FROM settle_mark WHERE company_id = ? AND person_id = ? AND group_key IN (?, ?)', company.id, '', `streakunit:${t.id}`, `streakfull:${t.id}`]);
+  const cfg = `${cfgOf(m.tiers)}|${streaks.map((x) => `${x.id}:${x.length}:${x.bonus}:${x.freeze_per_quarter}`).join(',')}|${win[0].key}|${win[win.length - 1].key}`;
+  const sigOf = (rows) => { const ev = rows[0][0]; return `${cfg}|${ev.c}|${ev.mx}|${ev.sm}|${streaks.map((_, i) => rsig(rows[1 + i][0])).join('/')}`; };
+  return { stmts, sigOf, markOf: (rows) => { const mk = rows[rows.length - 1]; return { hot: mk.find((x) => x.g === `streakunit:${t.id}`), full: mk.find((x) => x.g === `streakfull:${t.id}`) }; } };
+}
+const unitMarks = (ctx, companyId, t, sig, full) => ctx.db.batch([
+  ['INSERT INTO settle_mark (company_id, group_key, person_id, sig, checked_at) VALUES (?,?,?,?,?) ON CONFLICT (company_id, group_key, person_id) DO UPDATE SET sig = excluded.sig, checked_at = excluded.checked_at', companyId, `streakunit:${t}`, '', sig, ctx.now()],
+  ...(full ? [['INSERT INTO settle_mark (company_id, group_key, person_id, sig, checked_at) VALUES (?,?,?,?,?) ON CONFLICT (company_id, group_key, person_id) DO UPDATE SET sig = excluded.sig, checked_at = excluded.checked_at', companyId, `streakfull:${t}`, '', 'full', ctx.now()]] : []),
+]);
+
 /** Members of a unit with something to settle. Each: { id, group, kind, periodKey, entitled, at, fresh, prefix, label }. */
 async function planOf(ctx, company, u, rows, s, report) {
   const { t, m, pr } = u, todo = [];
   if (u.kind === 'person') {
-    const [ev, rw, mk] = rows, g = `tier:${t.id}:${pr.key}`, cfg = cfgOf(m.tiers);
+    const [ev, rw, mk] = rows, g = `tier:${t.id}:${pr.key}`, cfg = cfgOf(m.tiers) + capsOf(s);
     const evBy = new Map(ev.map((x) => [x.id, x])), rwBy = new Map(rw.map((x) => [x.id, x])), mkBy = new Map(mk.map((x) => [x.id, x]));
     for (const id of new Set([...evBy.keys(), ...rwBy.keys()])) {
       const e = evBy.get(id), n = e?.n ?? 0, total = e?.total ?? 0, prefix = `${cfg}|${n}|${total}|`, sig = prefix + rsig(rwBy.get(id)), entitled = tierReached(m.tiers, n)?.bonus ?? 0;
@@ -96,13 +135,13 @@ async function planOf(ctx, company, u, rows, s, report) {
       if (j === 'same') { report.unchanged++; continue; }
       if (j === 'wait') { report.retrying = (report.retrying ?? 0) + 1; continue; }
       if (!rwBy.has(id) && entitled === 0) { report.unchanged++; continue; } // nothing earned, nothing paid
-      todo.push({ id, group: g, kind: 'tier', periodKey: pr.key, entitled, at: pr.end - 1, fresh: !rwBy.has(id) && entitled > 0, prefix, label: t.name, count: 'tiers' });
+      todo.push({ sig, fails: retryInfo(mkBy.get(id))?.n ?? 0, id, group: g, kind: 'tier', periodKey: pr.key, entitled, at: pr.end - 1, fresh: !rwBy.has(id) && entitled > 0, prefix, label: t.name, count: 'tiers' });
     }
     return todo;
   }
   if (u.kind === 'team') {
     let [ev, teams, mem, tp, rw, mk] = rows;
-    const cfg = cfgOf(m.tiers), prefix = `team:${t.id}:${pr.key}:`, final = pr.end + s.late_close_days * DAY <= ctx.now();
+    const cfg = cfgOf(m.tiers) + capsOf(s), prefix = `team:${t.id}:${pr.key}:`, final = pr.end + s.late_close_days * DAY <= ctx.now();
     const have = new Set(tp.map((x) => x.team_id)), missing = teams.filter((x) => !have.has(x.id));
     if (missing.length) { // first close of this period: who was in each team is written down once (a snapshot), then read back
       for (const team of missing) await snapshotTeam(ctx, company, t, pr, team);
@@ -135,15 +174,25 @@ async function planOf(ctx, company, u, rows, s, report) {
       if (j === 'same') { report.unchanged++; continue; }
       if (j === 'wait') { report.retrying = (report.retrying ?? 0) + 1; continue; }
       if (!rr && entitled === 0) { report.unchanged++; continue; }
-      todo.push({ id, group: g, kind: 'team', periodKey: pr.key, entitled, at: pr.end - 1, fresh: !rr && entitled > 0, prefix: pre, label: t.name, count: 'team' });
+      todo.push({ sig, fails: retryInfo(mkBy.get(g + '|' + id))?.n ?? 0, id, group: g, kind: 'team', periodKey: pr.key, entitled, at: pr.end - 1, fresh: !rr && entitled > 0, prefix: pre, label: t.name, count: 'team' });
     }
     return todo;
   }
   // streaks
   const nP = Math.min(m.allPeriods.length, MAX_STREAK_PERIODS), periods = m.allPeriods.slice(-nP), windowKeys = new Set(m.periods.map((x) => x.key));
-  const hit = new Map(periods.map((p, i) => [p.key, new Set(rows[i].map((x) => x.id))]));
+  const cnt = new Map(periods.map((p) => [p.key, new Map()])); // period -> person -> events
+  const starts = periods.map((p) => p.start);
+  for (const r of rows[0]) { // a day belongs to exactly one period (period borders are midnights of the company clock)
+    const t0 = r.d * 86_400_000 - IST_MS;
+    let lo = 0, hi = starts.length - 1, at = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (starts[mid] <= t0) { at = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (at < 0 || t0 >= periods[at].end) continue;
+    const mp = cnt.get(periods[at].key); mp.set(r.id, (mp.get(r.id) ?? 0) + r.n);
+  }
+  const need = m.tiers[0].count;
+  const hit = new Map(periods.map((p) => [p.key, new Set([...cnt.get(p.key)].filter(([, n]) => n >= need).map(([id]) => id))]));
   u.streaks.forEach((st, si) => {
-    const rw = rows[nP + 2 * si], mk = rows[nP + 2 * si + 1], prefix = `streak:${st.id}:`;
+    const rw = rows[1 + 2 * si], mk = rows[2 + 2 * si], prefix = `streak:${st.id}:`;
     const rwBy = new Map(rw.map((x) => [x.g + '|' + x.id, x])), mkBy = new Map(mk.map((x) => [x.g + '|' + x.id, x]));
     const priorBy = new Map(); // person -> period keys that already have rows
     for (const x of rw) { if (!priorBy.has(x.id)) priorBy.set(x.id, new Set()); priorBy.get(x.id).add(x.g.slice(prefix.length)); }
@@ -158,11 +207,11 @@ async function planOf(ctx, company, u, rows, s, report) {
       }
       for (const k of new Set([...entitled, ...(priorBy.get(id) ?? [])])) {
         if (!windowKeys.has(k)) continue;
-        const pr2 = m.periods.find((x) => x.key === k), g = `${prefix}${k}`, want = entitled.has(k) ? st.bonus : 0, rr = rwBy.get(g + '|' + id), pre = `S${want}|`, sig = pre + rsig(rr), j = judge(ctx, mkBy.get(g + '|' + id), sig);
+        const pr2 = m.periods.find((x) => x.key === k), g = `${prefix}${k}`, want = entitled.has(k) ? st.bonus : 0, rr = rwBy.get(g + '|' + id), pre = `S${want}|${capsOf(s)}|`, sig = pre + rsig(rr), j = judge(ctx, mkBy.get(g + '|' + id), sig);
         if (j === 'same') { report.unchanged++; continue; }
         if (j === 'wait') { report.retrying = (report.retrying ?? 0) + 1; continue; }
         if (!rr && want === 0) { report.unchanged++; continue; }
-        todo.push({ id, group: g, kind: 'streak', periodKey: k, entitled: want, at: pr2.end - 1, fresh: !rr && want > 0, prefix: pre, label: t.name, count: 'streaks' });
+        todo.push({ sig, fails: retryInfo(mkBy.get(g + '|' + id))?.n ?? 0, id, group: g, kind: 'streak', periodKey: k, entitled: want, at: pr2.end - 1, fresh: !rr && want > 0, prefix: pre, label: t.name, count: 'streaks' });
       }
     }
   });
@@ -172,11 +221,13 @@ async function planOf(ctx, company, u, rows, s, report) {
 /** One member: settle it, then write its mark ONLY if the visit finished cleanly. A BudgetReached propagates (no mark: the member is visited again). */
 async function visit(ctx, company, report, x, person) {
   const e0 = report.errors ?? 0, rs0 = report.reversal_skipped ?? 0, bl0 = report.blocked ?? 0;
-  const out = await safeSettle(ctx, company, report, { person, kind: x.kind, groupKey: x.group, periodKey: x.periodKey, entitled: x.entitled, at: x.at, label: x.label, fresh: x.fresh });
+  let out = await safeSettle(ctx, company, report, { person, kind: x.kind, groupKey: x.group, periodKey: x.periodKey, entitled: x.entitled, at: x.at, label: x.label, fresh: x.fresh });
+  // A first payment answered 'stale' (a row of the group appeared since it was read: a failed, void or reissued one, or another run's payment): read the group again and decide from the real rows, once.
+  if (x.fresh && out.stale && ctx.budget.left() >= REVISIT_COST) out = await safeSettle(ctx, company, report, { person, kind: x.kind, groupKey: x.group, periodKey: x.periodKey, entitled: x.entitled, at: x.at, label: x.label, fresh: false });
   report[x.count]++; report.visited++; report.paid += out.paid ?? 0; report.reversed += out.reversed ?? 0;
   const blockedNow = (report.blocked ?? 0) > bl0 && !out.blocked && !out.failedCode; // a block in force (or just recorded): look again later, not weekly
   const unclean = (report.errors ?? 0) > e0 || (report.reversal_skipped ?? 0) > rs0 || out.stale;
-  if (blockedNow || unclean) { report.unclean = (report.unclean ?? 0) + 1; await retryMark(ctx, company.id, x.group, x.id, blockedNow ? 'RETRYB' : 'RETRY'); return; }
+  if (blockedNow || unclean) { report.unclean = (report.unclean ?? 0) + 1; await retryMark(ctx, company.id, x.group, x.id, `${blockedNow ? 'RETRYB' : 'RETRY'}:${(x.fails ?? 0) + 1}:${x.sig ?? ''}`); return; }
   await cleanMark(ctx, company.id, x.group, x.id, x.prefix);
 }
 
@@ -187,7 +238,7 @@ async function visit(ctx, company, report, x, person) {
 export async function settleBounded(ctx, company, asOf = ctx.now(), { force = false } = {}) {
   const b = ctx.budget, s = settingsOf(company), lag = force ? 0 : s.late_close_days * DAY;
   const report = { tiers: 0, paid: 0, reversed: 0, streaks: 0, team: 0, visited: 0, unchanged: 0 };
-  let pending = 0, unvisited = 0, cursor = null, done = false, stopped = false, total = 0;
+  let pending = 0, unvisited = 0, hotUnvisited = 0, cursor = null, done = false, stopped = false, total = 0, rowsHigh = false, coldLeft = 0, hotCount = 0, coldHeld = false, coldRead = 0, coldUsed0 = 0;
   try {
     if (b.left() < SCHEDULE_COST + 1) { stopped = true; unvisited = 1; throw new BudgetReached(); }
     const [targets, tierRows, starts, streakRows, cur] = await ctx.db.reads([
@@ -195,7 +246,7 @@ export async function settleBounded(ctx, company, asOf = ctx.now(), { force = fa
       ['SELECT * FROM tier WHERE target_id IN (SELECT id FROM period_target WHERE company_id = ?) ORDER BY target_id, idx', company.id],
       ["SELECT t.id id, (SELECT MIN(occurred_at) FROM event e WHERE e.company_id = t.company_id AND e.event_type = t.event_type AND e.stage = t.stage AND e.occurred_at >= t.active_from) a, (SELECT MIN(created_at) FROM reward r WHERE r.company_id = t.company_id AND r.group_key >= 'tier:' || t.id || ':' AND r.group_key < 'tier:' || t.id || ';') r1, (SELECT MIN(created_at) FROM reward r WHERE r.company_id = t.company_id AND r.group_key >= 'team:' || t.id || ':' AND r.group_key < 'team:' || t.id || ';') r2 FROM period_target t WHERE t.company_id = ?", company.id],
       ['SELECT * FROM streak WHERE target_id IN (SELECT id FROM period_target WHERE company_id = ?)', company.id],
-      ['SELECT settle_cursor FROM tick_state WHERE company_id = ?', company.id],
+      ['SELECT settle_cursor, rows_day, rows_read_day, cold_day, cold_used FROM tick_state WHERE company_id = ?', company.id],
     ]);
     const tiersBy = new Map(), startBy = new Map(starts.map((x) => [x.id, x]));
     for (const r of tierRows) { if (!tiersBy.has(r.target_id)) tiersBy.set(r.target_id, []); tiersBy.get(r.target_id).push(r); }
@@ -210,25 +261,53 @@ export async function settleBounded(ctx, company, asOf = ctx.now(), { force = fa
     units.sort((a, c) => (a.key < c.key ? 1 : a.key > c.key ? -1 : 0));
     const prio = units.filter((x) => x.rank < 2), rest = units.filter((x) => x.rank >= 2);
     const saved = cur[0]?.settle_cursor ?? null, from = saved ? rest.findIndex((x) => x.key < saved) : 0;
-    const order = prio.concat(streakUnits, from < 0 ? rest : rest.slice(from));
+    // Streak units: the cheap look first. A unit whose recent periods and rewards look as at its last clean visit (and whose whole history was read within a day) costs nothing more.
+    if (streakUnits.length && b.left() >= 4) {
+      const pre = streakUnits.map((u) => streakPre(company, u)), got = await ctx.db.reads(pre.flatMap((x) => x.stmts));
+      let off = 0;
+      streakUnits.forEach((u, k) => {
+        const rows = got.slice(off, off + pre[k].stmts.length); off += pre[k].stmts.length;
+        const mk = pre[k].markOf(rows), sig = pre[k].sigOf(rows);
+        u.sig = sig; u.hadHot = !!mk.hot && mk.hot.sig === sig; u.fullFresh = !!mk.full && ctx.now() - mk.full.at < STREAK_FULL_EVERY;
+        u.skip = u.hadHot && u.fullFresh;
+        if (u.skip) report.unchanged++;
+      });
+    }
+    // Cold rotation has a daily quota; above the soft rows-read limit the settle does hot work only.
+    const day = Math.floor(ctx.now() / DAY), st0 = cur[0] ?? {};
+    coldUsed0 = st0.cold_day === day ? st0.cold_used ?? 0 : 0;
+    const rowsToday = st0.rows_day === day ? st0.rows_read_day ?? 0 : 0;
+    rowsHigh = rowsToday >= rowsSoftLimit(ctx.env);
+    const quota = Math.max(COLD_MIN_PER_DAY, Math.ceil(rest.length / COLD_SWEEP_DAYS));
+    coldLeft = force ? Infinity : rowsHigh ? 0 : Math.max(0, quota - coldUsed0); // an admin's settle or a season close looks at every period, whatever the quota
+    const hot = prio.concat(streakUnits).filter((u) => !u.skip), coldList = from < 0 ? rest : rest.slice(from);
+    hotCount = hot.length;
+    const order = hot.concat(coldList);
     total = order.length;
     let i = 0;
     const people = new Map();
+    const isCold = (u) => u.rank >= 2 && u.kind !== 'streak';
     while (i < order.length && !stopped) {
       if (b.left() < 2) { stopped = true; break; }
-      const chunk = []; let stmts = 0;
+      const chunk = []; let stmts = 0, chunkCold = 0;
       while (i + chunk.length < order.length && chunk.length < CHUNK) {
-        const u = order[i + chunk.length], r = readsOf(company, u, s);
+        const u = order[i + chunk.length];
+        if (isCold(u) && coldLeft <= 0) { coldHeld = true; break; } // today's quota of idle old periods is used (or the rows-read limit is high): the rest waits for tomorrow
+        const r = readsOf(company, u, s);
         if (chunk.length && stmts + r.length > CHUNK_STATEMENTS) break;
-        chunk.push({ u, r }); stmts += r.length;
+        chunk.push({ u, r }); stmts += r.length; if (isCold(u)) chunkCold++;
       }
+      if (!chunk.length) break;
       const results = await ctx.db.reads(chunk.flatMap((c) => c.r));
       let off = 0; const plans = [];
       for (const c of chunk) { const rows = results.slice(off, off + c.r.length); off += c.r.length; plans.push(await planOf(ctx, company, c.u, rows, s, report)); }
+      // an old period that had something to settle is real work and costs no quota; only the ones found up to date count (they are the idle re-reads the quota is there to limit)
+      chunk.forEach((c, k) => { if (isCold(c.u) && plans[k].length === 0) { coldLeft--; coldRead++; } });
       const ids = [...new Set(plans.flat().map((x) => x.id))].slice(0, 80);
       if (ids.length && b.left() >= PAY_COST) for (const p of await ctx.db.all(`SELECT * FROM app_user WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids)) people.set(p.id, p);
       for (let k = 0; k < chunk.length; k++) {
         const u = chunk[k].u; let unitDone = true;
+        const e0 = report.errors ?? 0, un0 = report.unclean ?? 0, paid0 = report.paid, rs0 = report.reversal_skipped ?? 0, bl0 = report.blocked ?? 0;
         for (const x of plans[k]) {
           if (stopped || b.left() < (x.fresh ? PAY_COST : REVISIT_COST)) { // not enough left for this member: it is counted, the loop goes on to count the rest and ends
             if (!stopped && b.limit < PAY_COST + 8) b.budgetSmall = `${PAY_COST + 8}:${b.limit}`;
@@ -238,18 +317,25 @@ export async function settleBounded(ctx, company, asOf = ctx.now(), { force = fa
           if (!person) continue;
           await visit(ctx, company, report, x, person);
         }
-        if (unitDone) { if (u.rank >= 2 && u.kind !== 'streak') cursor = u.key; i++; }
+        if (unitDone) {
+          if (isCold(u)) cursor = u.key;
+          // a streak unit that was read whole and finished cleanly (nobody paid, nothing unclean): remember its fingerprint, so the next turns skip it
+          if (u.kind === 'streak' && u.sig && report.paid === paid0 && (report.errors ?? 0) === e0 && (report.unclean ?? 0) === un0 && (report.reversal_skipped ?? 0) === rs0 && (report.blocked ?? 0) === bl0 && b.left() >= 2) { try { await unitMarks(ctx, company.id, u.t.id, u.sig, true); } catch (e) { if (e instanceof BudgetReached) throw e; } }
+          i++;
+        }
         else break; // this unit is not finished: it and the units after it are looked at at the next turn
       }
     }
     unvisited = Math.max(0, order.length - i);
+    hotUnvisited = Math.max(0, hotCount - i);
     if (i >= order.length && !stopped && pending === 0) done = true;
   } catch (e) {
     if (!(e instanceof BudgetReached)) throw e;
     stopped = true; pending = Math.max(pending, 1); // the budget ended inside a read or a visit: the member is visited again at the next turn (the money paths replay safely)
   }
-  b.backlog = pending + unvisited; b.pending = pending; b.sweepLeft = unvisited; b.settleCursor = done ? null : cursor; b.settleCursorSet = done ? true : cursor !== null;
-  const out = { ...report, backlog: b.backlog, pending, sweepLeft: unvisited, units: total };
+  // The driver loops while backlog > 0: it counts members known to need work and HOT units not looked at yet. Old periods in rotation (cold) are not backlog: they are limited by a daily quota.
+  b.backlog = pending + (force ? unvisited : hotUnvisited); b.pending = pending; b.sweepLeft = unvisited; b.coldRead = coldRead; b.coldHeld = coldHeld; b.rowsHigh = rowsHigh; b.settleCursor = done ? null : cursor; b.settleCursorSet = done ? true : cursor !== null;
+  const out = { ...report, backlog: b.backlog, pending, sweepLeft: unvisited, units: total, cold_read: coldRead, cold_held: coldHeld, rows_high: rowsHigh };
   if (report.paid || report.reversed || report.errors || report.newly_blocked || report.unblocked) { // the same one line as the unbounded settle
     try { if (b.left() >= 3) await commit(ctx, company.id, 'system', 'settle', { tiers: report.tiers, paid: report.paid, reversed: report.reversed, streaks: report.streaks, team: report.team, errors: report.errors, newly_blocked: report.newly_blocked, unblocked: report.unblocked }, []); } catch { /* the next tick */ }
   }

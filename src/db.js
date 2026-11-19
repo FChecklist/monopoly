@@ -10,13 +10,15 @@ export function openDb(path = ':memory:') {
   const raw = new DatabaseSync(path);
   raw.exec('PRAGMA foreign_keys = ON');
   let lock = Promise.resolve();
+  // Rows the port has handed out (rowsRead: the rows returned; D1 counts the rows SCANNED, which is more) and changed (rowsWritten). The clock keeps a per-day total of these (tick_state.rows_*_day).
+  const stats = { rowsRead: 0, rowsWritten: 0 };
   return {
-    raw,
-    async first(sql, ...p) { return raw.prepare(sql).get(...p) ?? null; },
-    async all(sql, ...p) { return raw.prepare(sql).all(...p); },
-    async run(sql, ...p) { return { changes: Number(raw.prepare(sql).run(...p).changes) }; },
+    raw, stats,
+    async first(sql, ...p) { const r = raw.prepare(sql).get(...p) ?? null; if (r) stats.rowsRead++; return r; },
+    async all(sql, ...p) { const r = raw.prepare(sql).all(...p); stats.rowsRead += r.length; return r; },
+    async run(sql, ...p) { const c = Number(raw.prepare(sql).run(...p).changes); stats.rowsWritten += c; return { changes: c }; },
     /** Several SELECTs in ONE round trip (D1: one batch, which counts as ONE query for the per-invocation limit). stmts: array of [sql, ...params]. Returns an array of row arrays. */
-    async reads(stmts) { return stmts.map(([sql, ...p]) => raw.prepare(sql).all(...p)); },
+    async reads(stmts) { const out = stmts.map(([sql, ...p]) => raw.prepare(sql).all(...p)); for (const r of out) stats.rowsRead += r.length; return out; },
     /** stmts: array of [sql, ...params]. Returns array of {changes}. */
     async batch(stmts) {
       const prev = lock;
@@ -28,6 +30,7 @@ export function openDb(path = ':memory:') {
         try {
           const out = stmts.map(([sql, ...p]) => ({ changes: Number(raw.prepare(sql).run(...p).changes) }));
           raw.exec('COMMIT');
+          for (const o of out) stats.rowsWritten += o.changes;
           return out;
         } catch (e) {
           raw.exec('ROLLBACK');

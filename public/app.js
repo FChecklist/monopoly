@@ -595,7 +595,16 @@
   }
 
   // ---------- manager ----------
-  async function people() { return (await get('/api/people')).people; }
+  async function people() { // the list comes in pages: go on until the server says there is no more
+    var all = [], off = 0;
+    for (var guard = 0; guard < 500; guard++) {
+      var r = await get('/api/people?limit=100&offset=' + off);
+      all = all.concat(r.people);
+      if (r.next_offset === null || r.next_offset === undefined) break;
+      off = r.next_offset;
+    }
+    return all;
+  }
   function personLabel(p) { return p.name || ('Person ' + tail(p.id)); }
 
   function eventLine(e) { return human(e.event_type) + ' - ' + e.stage + ' (' + e.ext_id + ')'; }
@@ -771,6 +780,12 @@
         if (r.rejected.length) kids.push(h('p', { text: 'These rows will be skipped:' }), table(['Row', 'Why'], r.rejected.map(function (x) { return [String(x.row), (REASONS[x.reason] || human(x.reason))]; })));
         if (r.accepted > 0) kids.push(button('Confirm and import', async function () {
           var c = await post('/api/events/csv', { csv: ta.ctl.value, commit: true });
+          // A big file is entered in several calls (the server stops when one call's work is used up and says where to go on).
+          for (var guard = 0; c.more && c.next_row && guard < 2000; guard++) {
+            var more = await post('/api/events/csv', { csv: ta.ctl.value, commit: true, from_row: c.next_row });
+            more.results = (c.results || []).concat(more.results || []);
+            c = more;
+          }
           out.replaceChildren(h('p', { 'class': 'note', text: 'Imported.' }), table(['Reference', 'Result'], (c.results || []).map(function (x) { return [x.ext_id, x.ok ? ((STATUS[x.status] || [x.status || 'saved'])[0]) : (REASONS[x.reason] || human(x.reason || 'skipped'))]; })));
         }, 'primary'));
         out.replaceChildren.apply(out, kids.filter(Boolean));
@@ -983,6 +998,11 @@
         out.replaceChildren.apply(out, [table(['Name', 'E-mail looks ok'], r.rows.map(function (x) { return [x.name || '', x.email_ok ? 'Yes' : 'No']; })),
           r.rows.length ? button('Confirm and add', async function () {
             var c = await post('/api/admin/people/csv', { csv: ta.ctl.value, commit: true });
+            for (var guard = 0; c.more && c.next_row && guard < 2000; guard++) { // a big file is added in several calls
+              var more = await post('/api/admin/people/csv', { csv: ta.ctl.value, commit: true, from_row: c.next_row });
+              more.rows = c.rows.concat(more.rows);
+              c = more;
+            }
             var lines = c.rows.filter(function (x) { return x.ok; }).map(function (x) { return x.id + ': ' + x.invite_code; }).join('\n');
             var bad = c.rows.filter(function (x) { return !x.ok; }).length;
             out.replaceChildren(h('p', { 'class': 'note warn', text: 'Shown once. ' + (c.rows.length - bad) + ' added, ' + bad + ' skipped. Copy the codes now.' }), h('textarea', { readonly: true, rows: 6, 'aria-label': 'Invite codes, shown once', text: lines }));

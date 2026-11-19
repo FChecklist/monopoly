@@ -1,7 +1,7 @@
 // HTTP API. One function: handle(ctx, Request) -> Response. Works in Workers, Pages Functions and the local server.
 import { ApiError, newId, safeEqual, clean, mustInt, DAY, int, clampLimit, periodOf, jsonOut as out, parseBody as parse, sameOrigin } from './util.js';
 import { PRODUCT, DEFAULTS, providerCapWarnings, settingsOf, SQUARES, TOKENS, HIDE_NAME_NOTICE } from './config.js';
-import { commit, verifyChain } from './audit.js';
+import { commit, commitMany, verifyChain } from './audit.js';
 import * as P from './people.js';
 import * as S from './setup.js';
 import * as E from './events.js';
@@ -13,7 +13,8 @@ import { settleCompany, simulateBudget, countFor, tiersOf } from './periods.js';
 import { ProviderError } from './provider/errors.js';
 import { shopOn, buyOn, assertBuy } from './v1.js';
 import { openOps, retryOps } from './provider-ops.js';
-import { makeBudget, budgetLimit, withBudget, BudgetReached, coalescingDb } from './budget.js';
+import { makeBudget, budgetLimit, withBudget, BudgetReached, coalescingDb, batchGate, invocationLimit } from './budget.js';
+import { rowsSoftLimit } from './settle_bounded.js';
 
 const MAX_BODY = 1_500_000;
 
@@ -85,7 +86,9 @@ const rollOf = async (ctx, company, personId, eventId) => {
 };
 
 const routes = [];
-const route = (method, pattern, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:id/g, '([A-Za-z0-9_\\-]+)') + '$'), fn });
+/** Every route the app serves, for the route-crawler test: [{method, path}] (the signed system routes and the /api/v1 table are listed too). */
+export const listRoutes = () => [...routes.map((r) => ({ method: r.method, path: r.pattern, kind: 'session' })), ...sysRoutes.map((r) => ({ method: r[0], path: r[1], kind: 'signed' }))];
+const route = (method, pattern, fn) => routes.push({ method, pattern, re: new RegExp('^' + pattern.replace(/:id/g, '([A-Za-z0-9_\\-]+)') + '$'), fn });
 
 // ---------- open ----------
 route('GET', '/api/health', async (c) => ({ ok: true, product: PRODUCT.slug, db: !!(await c.ctx.db.first('SELECT 1 x')) }));
@@ -141,12 +144,12 @@ route('GET', '/api/me/rewards', async (c) => ({
   corrections: await c.ctx.db.all("SELECT id, amount, recovered, state, reason FROM correction WHERE company_id = ? AND person_id = ? AND state IN ('open','frozen')", c.company.id, c.user.id),
 }));
 route('GET', '/api/me/targets', async (c) => {
-  const s = settingsOf(c.company), now = c.ctx.now(), res = [];
-  for (const t of await c.ctx.db.all("SELECT * FROM period_target WHERE company_id = ? AND scope = 'person'", c.company.id)) {
-    const p = periodOf(t.period, now, s.fy_start_month), tiers = await tiersOf(c.ctx, t.id);
-    res.push({ id: t.id, name: t.name, period: t.period, period_key: p.key, ends_at: p.end, count: await countFor(c.ctx, c.company, t, c.user.id, p.start, p.end), tiers: tiers.map((x) => ({ count: x.count, bonus: x.bonus })) });
-  }
-  return { targets: res };
+  const s = settingsOf(c.company), now = c.ctx.now();
+  // Targets, all their tiers and the person's count per target in ONE round trip.
+  const [ts, tiers] = await c.ctx.db.reads([["SELECT * FROM period_target WHERE company_id = ? AND scope = 'person'", c.company.id], ['SELECT t.* FROM tier t JOIN period_target pt ON pt.id = t.target_id WHERE pt.company_id = ? ORDER BY t.target_id, t.idx', c.company.id]]);
+  const ps = ts.map((t) => periodOf(t.period, now, s.fy_start_month));
+  const counts = ts.length ? await c.ctx.db.reads(ts.map((t, i) => ["SELECT COUNT(*) n FROM event WHERE company_id=? AND person_id=? AND event_type=? AND stage=? AND status IN ('applied','reversal_pending') AND occurred_at >= ? AND occurred_at < ?", c.company.id, c.user.id, t.event_type, t.stage, t.active_from ? Math.max(ps[i].start, t.active_from) : ps[i].start, ps[i].end])) : [];
+  return { targets: ts.map((t, i) => ({ id: t.id, name: t.name, period: t.period, period_key: ps[i].key, ends_at: ps[i].end, count: counts[i][0].n, tiers: tiers.filter((x) => x.target_id === t.id).map((x) => ({ count: x.count, bonus: x.bonus })) })) };
 });
 route('GET', '/api/me/penalties', async (c) => ({ cases: await c.ctx.db.all("SELECT id, effect, amount, reason, state, apply_at, appeal_by, decision_note FROM penalty_case WHERE person_id = ? AND state != 'proposed' ORDER BY created_at DESC", c.user.id) }));
 route('POST', '/api/me/rights', async (c) => {
@@ -176,24 +179,29 @@ route('GET', '/api/team/board', async (c) => {
   else team = await c.ctx.db.first('SELECT * FROM team WHERE company_id = ? AND id = ?', c.company.id, q ?? '');
   if (!team) throw new ApiError(404, 'no_team', 'No such team.');
   if (c.user.role === 'hr') throw new ApiError(403, 'not_allowed', 'HR sees aggregates, not a team board.');
-  const members = await c.ctx.db.all("SELECT * FROM app_user WHERE company_id = ? AND team_id = ? AND status = 'active'", c.company.id, team.id);
+  const { limit, offset } = PAGE(c.url);
+  // Members, their tokens and the pool in ONE round trip (a person without a board yet is shown at the start; the board row is made when the person first plays).
+  const [members, [pool]] = await c.ctx.db.reads([
+    ["SELECT u.id, u.name_sealed, u.hide_name, u.avatar, b.position, b.level, b.laps FROM app_user u LEFT JOIN board_state b ON b.person_id = u.id WHERE u.company_id = ? AND u.team_id = ? AND u.status = 'active' ORDER BY u.id LIMIT ? OFFSET ?", c.company.id, team.id, limit + 1, offset],
+    ['SELECT points FROM pool WHERE company_id = ? AND team_id = ?', c.company.id, team.id],
+  ]);
   const tokens = [];
-  for (const u of members) { const b = await B.ensureBoard(c.ctx, c.company, u.id); tokens.push({ id: u.id, name: await P.displayName(c.ctx, u), avatar: u.avatar, position: b.position, level: b.level, laps: b.laps }); }
-  const pool = await c.ctx.db.first('SELECT points FROM pool WHERE company_id = ? AND team_id = ?', c.company.id, team.id);
-  return { team: { id: team.id, name: team.name }, squares: SQUARES, tokens, pool_points: pool?.points ?? 0 };
+  for (const u of members.slice(0, limit)) tokens.push({ id: u.id, name: await P.displayName(c.ctx, u), avatar: u.avatar, position: u.position ?? 0, level: u.level ?? 1, laps: u.laps ?? 0 });
+  return { team: { id: team.id, name: team.name }, squares: SQUARES, tokens, pool_points: pool?.points ?? 0, next_offset: members.length > limit ? offset + limit : null, page_size: limit };
 });
 /** Team-vs-team league: ranked by verified achievement per head, so small teams are not punished. Visible by role and setting. */
 route('GET', '/api/league', async (c) => {
   const s = settingsOf(c.company);
   if (c.user.role === 'employee' && !s.leaderboard) throw new ApiError(403, 'leaderboard_off', 'The leaderboard is switched off for this company.');
   const p = periodOf(c.url.searchParams.get('period') === 'week' ? 'week' : 'month', c.ctx.now(), s.fy_start_month);
-  const teams = await c.ctx.db.all('SELECT * FROM team WHERE company_id = ?', c.company.id);
-  const rows = [];
-  for (const t of teams) {
-    const head = (await c.ctx.db.first("SELECT COUNT(*) n FROM app_user WHERE team_id = ? AND status = 'active'", t.id)).n;
-    const ev = (await c.ctx.db.first("SELECT COUNT(*) n FROM event e JOIN app_user u ON u.id = e.person_id WHERE e.company_id = ? AND u.team_id = ? AND e.status = 'applied' AND e.occurred_at >= ? AND e.occurred_at < ?", c.company.id, t.id, p.start, p.end)).n;
-    rows.push({ team_id: t.id, team: t.name, members: head, achievements: ev, per_head: head ? Math.round((ev / head) * 100) / 100 : 0 });
-  }
+  // Heads and achievements of EVERY team in one round trip (two grouped queries), never two queries per team.
+  const [teams, heads, evs] = await c.ctx.db.reads([
+    ['SELECT id, name FROM team WHERE company_id = ?', c.company.id],
+    ["SELECT team_id, COUNT(*) n FROM app_user WHERE company_id = ? AND team_id IS NOT NULL AND status = 'active' GROUP BY team_id", c.company.id],
+    ["SELECT u.team_id, COUNT(*) n FROM event e JOIN app_user u ON u.id = e.person_id WHERE e.company_id = ? AND u.team_id IS NOT NULL AND e.status = 'applied' AND e.occurred_at >= ? AND e.occurred_at < ? GROUP BY u.team_id", c.company.id, p.start, p.end],
+  ]);
+  const headOf = new Map(heads.map((r) => [r.team_id, r.n])), evOf = new Map(evs.map((r) => [r.team_id, r.n]));
+  const rows = teams.map((t) => { const head = headOf.get(t.id) ?? 0, ev = evOf.get(t.id) ?? 0; return { team_id: t.id, team: t.name, members: head, achievements: ev, per_head: head ? Math.round((ev / head) * 100) / 100 : 0 }; });
   rows.sort((a, b) => b.per_head - a.per_head);
   let ranked = rows.map((r, i) => ({ ...r, rank: i + 1 }));
   if (c.user.role === 'manager') ranked = ranked.filter((r) => r.team_id === c.user.team_id || true).map((r) => (r.team_id === c.user.team_id ? r : { rank: r.rank, team: r.team, per_head: r.per_head })); // a manager sees own team's detail only
@@ -208,25 +216,36 @@ route('POST', '/api/events', async (c) => {
   if (r.ok && r.id && await c.ctx.db.first("SELECT id FROM reward WHERE event_id = ? AND kind = 'bonus_roll'", r.id)) r.roll = await rollOf(c.ctx, c.company, (await c.ctx.db.first('SELECT person_id FROM event WHERE id = ?', r.id)).person_id, r.id);
   return r;
 });
-route('POST', '/api/events/csv', async (c) => { need(c.user, 'manager', 'admin', 'hr'); return E.importCsv(c.ctx, c.company, c.user, String(c.body.csv ?? ''), { commit: c.body.commit === true }); });
+route('POST', '/api/events/csv', async (c) => { need(c.user, 'manager', 'admin', 'hr'); return E.importCsv(c.ctx, c.company, c.user, String(c.body.csv ?? ''), { commit: c.body.commit === true, fromRow: c.body.from_row }); });
+const PAGE = (url, def = 50, max = 100) => ({ limit: clampLimit(url.searchParams.get('limit'), def, max), offset: Math.max(0, Math.min(1e6, Math.trunc(Number(url.searchParams.get('offset'))) || 0)) });
 route('GET', '/api/events', async (c) => {
   need(c.user, 'manager', 'admin', 'hr');
   const status = c.url.searchParams.get('status');
+  const { limit, offset } = PAGE(c.url);
   const where = ['e.company_id = ?'], p = [c.company.id];
   if (status) { where.push('e.status = ?'); p.push(status); }
   if (c.user.role === 'manager') { where.push('u.team_id IN (SELECT id FROM team WHERE manager_id = ?)'); p.push(c.user.id); }
-  const rows = await c.ctx.db.all(`SELECT e.id, e.person_id, e.event_type, e.stage, e.ext_id, e.occurred_at, e.status, e.source, e.approvals_required, e.approvals_done, e.submitted_by, e.reason, e.reversal_kind, e.reversal_due, e.reversal_appeal FROM event e JOIN app_user u ON u.id = e.person_id WHERE ${where.join(' AND ')} ORDER BY e.created_at DESC LIMIT 200`, ...p);
+  const page = await c.ctx.db.all(`SELECT e.id, e.person_id, e.event_type, e.stage, e.ext_id, e.occurred_at, e.status, e.source, e.approvals_required, e.approvals_done, e.submitted_by, e.reason, e.reversal_kind, e.reversal_due, e.reversal_appeal FROM event e JOIN app_user u ON u.id = e.person_id WHERE ${where.join(' AND ')} ORDER BY e.created_at DESC, e.id LIMIT ? OFFSET ?`, ...p, limit + 1, offset);
+  const rows = page.slice(0, limit), next_offset = page.length > limit ? offset + limit : null;
   // Managers and admin see real names (their job needs it; the notice says so). HR sees person ids only, and a name only for a person
-  // with an open case, and every such look is written to the audit trail.
+  // with an open case, and every such look is written to the audit trail. The people and the open cases of a whole page are read in ONE round trip.
   const names = new Map();
-  for (const r of rows) {
-    if (names.has(r.person_id)) continue;
-    const person = await c.ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
-    if (c.user.role !== 'hr') { names.set(r.person_id, await P.displayName(c.ctx, person, { forceReal: true })); continue; }
-    const open = !!(await c.ctx.db.first("SELECT id FROM penalty_case WHERE person_id = ? AND state IN ('proposed','pending','appealed')", person.id)) || !!(await c.ctx.db.first("SELECT id FROM event WHERE person_id = ? AND status = 'reversal_pending'", person.id));
-    if (open) { names.set(r.person_id, await P.displayName(c.ctx, person, { forceReal: true })); await commit(c.ctx, c.company.id, c.user.id, 'view.person', { person: person.id, via: 'events' }); }
+  const ids = [...new Set(rows.map((r) => r.person_id))];
+  if (ids.length) {
+    const marks = ids.map(() => '?').join(',');
+    const [people, cases, reversals] = await c.ctx.db.reads([
+      [`SELECT * FROM app_user WHERE id IN (${marks})`, ...ids],
+      ...(c.user.role === 'hr' ? [[`SELECT DISTINCT person_id FROM penalty_case WHERE person_id IN (${marks}) AND state IN ('proposed','pending','appealed')`, ...ids], [`SELECT DISTINCT person_id FROM event WHERE person_id IN (${marks}) AND status = 'reversal_pending'`, ...ids]] : []),
+    ]);
+    const open = new Set([...(cases ?? []), ...(reversals ?? [])].map((r) => r.person_id));
+    const seen = [];
+    for (const person of people) {
+      if (c.user.role !== 'hr') { names.set(person.id, await P.displayName(c.ctx, person, { forceReal: true })); continue; }
+      if (open.has(person.id)) { names.set(person.id, await P.displayName(c.ctx, person, { forceReal: true })); seen.push({ action: 'view.person', data: { person: person.id, via: 'events' } }); }
+    }
+    await commitMany(c.ctx, c.company.id, c.user.id, seen); // one batch, one audit line per person looked at
   }
-  return { events: rows.map((r) => (names.has(r.person_id) ? { ...r, person: names.get(r.person_id) } : { ...r })) };
+  return { events: rows.map((r) => (names.has(r.person_id) ? { ...r, person: names.get(r.person_id) } : { ...r })), next_offset, page_size: limit };
 });
 route('POST', '/api/events/:id/approve', async (c, m) => E.approveEvent(c.ctx, c.company, c.user, idOf(m)));
 route('POST', '/api/events/:id/reject', async (c, m) => E.rejectEvent(c.ctx, c.company, c.user, idOf(m), c.body.reason));
@@ -276,12 +295,13 @@ route('POST', '/api/lane/:id/finish', async (c, m) => {
 // ---------- people (manager / admin / hr views) ----------
 route('GET', '/api/people', async (c) => {
   need(c.user, 'manager', 'admin', 'hr');
+  const { limit, offset } = PAGE(c.url);
   const rows = await c.ctx.db.all(c.user.role === 'manager'
-    ? "SELECT u.* FROM app_user u JOIN team t ON t.id = u.team_id WHERE u.company_id = ? AND t.manager_id = ? AND u.status = 'active'"
-    : "SELECT * FROM app_user WHERE company_id = ? AND ? IS NOT NULL AND status = 'active'", c.company.id, c.user.id);
+    ? "SELECT u.* FROM app_user u JOIN team t ON t.id = u.team_id WHERE u.company_id = ? AND t.manager_id = ? AND u.status = 'active' ORDER BY u.id LIMIT ? OFFSET ?"
+    : "SELECT * FROM app_user WHERE company_id = ? AND ? IS NOT NULL AND status = 'active' ORDER BY id LIMIT ? OFFSET ?", c.company.id, c.user.id, limit + 1, offset);
   const people = [];
-  for (const u of rows) people.push(c.user.role === 'hr' ? { id: u.id, team_id: u.team_id, role: u.role } : await P.privateUser(c.ctx, u).then(({ work_id, ...x }) => ({ ...x, work_id })));
-  return { people };
+  for (const u of rows.slice(0, limit)) people.push(c.user.role === 'hr' ? { id: u.id, team_id: u.team_id, role: u.role } : await P.privateUser(c.ctx, u).then(({ work_id, ...x }) => ({ ...x, work_id })));
+  return { people, next_offset: rows.length > limit ? offset + limit : null, page_size: limit };
 });
 route('GET', '/api/people/:id/summary', async (c, m) => {
   const person = await c.ctx.db.first('SELECT * FROM app_user WHERE id = ? AND company_id = ?', idOf(m), c.company.id);
@@ -293,11 +313,13 @@ route('GET', '/api/people/:id/summary', async (c, m) => {
 route('GET', '/api/team/contributions', async (c) => {
   need(c.user, 'manager', 'admin');
   const s = settingsOf(c.company), p = periodOf('month', c.ctx.now(), s.fy_start_month);
+  const { limit, offset } = PAGE(c.url);
   const teamQ = c.user.role === 'manager' ? 'AND t.manager_id = ?' : 'AND ? IS NOT NULL';
-  const rows = await c.ctx.db.all(`SELECT u.id, COUNT(e.id) n FROM app_user u JOIN team t ON t.id = u.team_id LEFT JOIN event e ON e.person_id = u.id AND e.status = 'applied' AND e.occurred_at >= ? AND e.occurred_at < ? WHERE u.company_id = ? ${teamQ} GROUP BY u.id`, p.start, p.end, c.company.id, c.user.id);
+  // The name comes with the row (one query for the page), and a page holds at most `limit` people.
+  const rows = await c.ctx.db.all(`SELECT u.id, u.name_sealed, u.hide_name, COUNT(e.id) n FROM app_user u JOIN team t ON t.id = u.team_id LEFT JOIN event e ON e.person_id = u.id AND e.status = 'applied' AND e.occurred_at >= ? AND e.occurred_at < ? WHERE u.company_id = ? ${teamQ} GROUP BY u.id ORDER BY u.id LIMIT ? OFFSET ?`, p.start, p.end, c.company.id, c.user.id, limit + 1, offset);
   const res = [];
-  for (const r of rows) res.push({ person: await P.displayName(c.ctx, await c.ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.id), { forceReal: true }), events: r.n });
-  return { period: p.key, contributions: res };
+  for (const r of rows.slice(0, limit)) res.push({ person: await P.displayName(c.ctx, r, { forceReal: true }), events: r.n });
+  return { period: p.key, contributions: res, next_offset: rows.length > limit ? offset + limit : null, page_size: limit };
 });
 
 // ---------- admin ----------
@@ -325,19 +347,30 @@ route('POST', '/api/admin/people/:id/remove', async (c, m) => {
 route('POST', '/api/admin/people/csv', async (c) => {
   adm(c);
   const rows = (await import('./events.js')).parseCsv(String(c.body.csv ?? ''), 2000), res = [];
-  for (const r of rows) {
+  // A commit works through the rows until the invocation budget is used and answers { more, next_row }: send the same file again with from_row = next_row (whole rows only).
+  const gate = batchGate(c.ctx), from = Math.max(0, Math.trunc(Number(c.body.from_row)) || 0);
+  let more = false, next_row = null;
+  for (const [i, r] of rows.entries()) {
     if (c.body.commit !== true) { res.push({ email_ok: !!r.work_email, name: r.name }); continue; }
+    if (i + 2 < from) continue;
+    if (!gate.canTake()) { more = true; next_row = i + 2; break; }
+    gate.begin();
     try { const { user, code } = await P.addPerson(c.ctx, c.company, c.user, { email: r.work_email, name: r.name, work_id: r.work_id, role: ['manager', 'hr', 'employee'].includes(r.role) ? r.role : 'employee', team_id: r.team_id || null }); res.push({ ok: true, id: user.id, invite_code: code }); }
     catch (e) { res.push({ ok: false, reason: e.code ?? 'error' }); }
+    finally { gate.end(); }
   }
-  return { committed: c.body.commit === true, rows: res };
+  return { committed: c.body.commit === true, rows: res, more, next_row };
 });
 route('GET', '/api/admin/rate-card', async (c) => { adm(c); return { rows: await c.ctx.db.all('SELECT * FROM rate_card WHERE company_id = ? ORDER BY event_type, stage_no, version DESC', c.company.id) }; });
 route('POST', '/api/admin/rate-card', async (c) => { adm(c); return S.addRateCard(c.ctx, c.company, c.user, c.body); });
 route('GET', '/api/admin/targets', async (c) => {
   adm(c);
-  const ts = await c.ctx.db.all('SELECT * FROM period_target WHERE company_id = ?', c.company.id);
-  for (const t of ts) { t.tiers = await tiersOf(c.ctx, t.id); t.streak = await c.ctx.db.first('SELECT length, bonus, freeze_per_quarter FROM streak WHERE target_id = ?', t.id); }
+  const [ts, tiers, streaks] = await c.ctx.db.reads([
+    ['SELECT * FROM period_target WHERE company_id = ?', c.company.id],
+    ['SELECT t.* FROM tier t JOIN period_target pt ON pt.id = t.target_id WHERE pt.company_id = ? ORDER BY t.target_id, t.idx', c.company.id],
+    ['SELECT s.* FROM streak s JOIN period_target pt ON pt.id = s.target_id WHERE pt.company_id = ?', c.company.id],
+  ]);
+  for (const t of ts) { t.tiers = tiers.filter((x) => x.target_id === t.id); const st = streaks.find((x) => x.target_id === t.id); t.streak = st ? { length: st.length, bonus: st.bonus, freeze_per_quarter: st.freeze_per_quarter } : null; }
   return { targets: ts };
 });
 route('POST', '/api/admin/targets', async (c) => { adm(c); return S.addTarget(c.ctx, c.company, c.user, c.body); });
@@ -349,10 +382,12 @@ route('POST', '/api/admin/seasons/:id/budget', async (c, m) => { adm(c); await S
 async function settleRoute(c, force) {
   const lim = budgetLimit(c.ctx.env);
   if (lim <= 0) return settleCompany(c.ctx, c.company, c.ctx.now(), { force });
-  const inv = Number(c.ctx.env.INVOCATION_QUERY_LIMIT) || 50;
-  const b = makeBudget(Math.max(MIN_DRIVER_BUDGET, Math.min(lim, inv - (c.ctx.budget?.used ?? 0) - MARGIN) - 3)), t = withBudget(c.ctx, b);
+  const inv = invocationLimit(c.ctx.env);
+  // the allowance never exceeds what is left of THIS invocation (what the request used before, a margin, and the bookkeeping below are taken off)
+  const b = makeBudget(Math.max(4, Math.min(Math.max(lim, MIN_DRIVER_BUDGET), inv - (c.ctx.budget?.used ?? 0) - MARGIN) - 4)), t = withBudget(c.ctx, b);
   const r = await settleCompany(t, c.company, c.ctx.now(), { force });
-  try { await c.ctx.db.run('INSERT INTO tick_state (company_id, settle_cursor) VALUES (?,?) ON CONFLICT (company_id) DO UPDATE SET settle_cursor = excluded.settle_cursor', c.company.id, b.settleCursorSet ? (b.settleCursor ?? null) : null); } catch { /* the next call starts again from the top: the finished groups are cheap */ }
+  // the cursor is saved only when the settle really moved it (or finished the round): an unset cursor leaves the saved one alone, it is never overwritten with NULL
+  if (b.settleCursorSet) { try { await c.ctx.db.run('INSERT INTO tick_state (company_id, settle_cursor) VALUES (?,?) ON CONFLICT (company_id) DO UPDATE SET settle_cursor = excluded.settle_cursor', c.company.id, b.settleCursor ?? null); } catch { /* the next call starts again from the saved cursor: the finished groups are cheap */ } }
   return { ...r, more: (b.backlog ?? 0) > 0 };
 }
 route('POST', '/api/admin/seasons/:id/close', async (c, m) => { adm(c); const r = await settleRoute(c, true); if (r.more) return { more: true, closed: false }; return S.closeSeason(c.ctx, c.company, c.user, idOf(m)); });
@@ -439,7 +474,7 @@ route('GET', '/api/admin/overview', async (c) => {
   const cid = c.company.id;
   const o = await resolveAll({
     last_ok: q('SELECT last_tick_ok_at n FROM company WHERE id = ?', cid),
-    tick_state: cx.db.first('SELECT backlog, sweep_left, backlog_ticks, budget_small FROM tick_state WHERE company_id = ?', cid),
+    tick_state: cx.db.first('SELECT backlog, sweep_left, backlog_ticks, budget_small, rows_day, rows_read_day, rows_written_day, cold_day, cold_used FROM tick_state WHERE company_id = ?', cid),
     stage_errors: cx.db.all('SELECT stage, first_at, last_at, count FROM tick_stage WHERE company_id = ? AND count > 0 ORDER BY first_at', cid),
     people: q("SELECT COUNT(*) n FROM app_user WHERE company_id = ? AND status = 'active'", cid),
     events_pending: q("SELECT COUNT(*) n FROM event WHERE company_id = ? AND status IN ('pending','held')", cid),
@@ -472,6 +507,8 @@ route('GET', '/api/admin/overview', async (c) => {
   });
   const ts = o.tick_state; o.tick_backlog = ts?.backlog ?? 0; o.tick_sweep_left = ts?.sweep_left ?? 0; o.tick_backlog_ticks = ts?.backlog_ticks ?? 0;
   o.tick_budget_small = ts?.budget_small ?? null;
+  const today = Math.floor(c.ctx.now() / DAY), soft = rowsSoftLimit(c.ctx.env);
+  o.rows_read_today = ts?.rows_day === today ? ts.rows_read_day : 0; o.rows_written_today = ts?.rows_day === today ? ts.rows_written_day : 0; o.rows_read_soft_limit = soft;
   o.tick_stage_errors = o.stage_errors.map((x) => ({ stage: x.stage, first_at: x.first_at, at: x.last_at, count: x.count }));
   o.tick_stage_error = o.tick_stage_errors[0] ? { stage: o.tick_stage_errors[0].stage, at: o.tick_stage_errors[0].at } : null; // the oldest uncleared one
   const lastOk = o.last_ok; o.last_tick_at = lastOk || null; o.tick_stale = (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000;
@@ -480,8 +517,9 @@ route('GET', '/api/admin/overview', async (c) => {
   const say = { needs_admin: 'Some rewards need an admin: open "Rewards that need an admin" and check the Moneypenny ledger. A failed or partly granted event reward can be re-issued there as a NEW grant (after you checked the ledger); a period bonus (tier, streak, team) is fixed by hand outside the app in v1. Nothing is paid again by itself. A provider cap such as the daily one may clear within 24 hours.', open_partial_grants: 'A reward was granted only in part (the provider paid less than asked). Check the Moneypenny ledger: an event reward can be re-issued for what is missing; for a period bonus the missing part is added by hand outside the app. Nothing is topped up by itself.', open_failed_periods: 'A period bonus (tier, streak or team) failed or was only partly granted and is blocked: open "Rewards that need an admin", check the Moneypenny ledger and fix it by hand outside the app. Nothing is paid again by itself.', unconfirmed_credits: 'The provider said a credit already exists but could not confirm it. Check the Moneypenny ledger: if the credit landed, record it by hand outside the app; re-issue it only if it did NOT land.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.',   rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
   for (const x of o.tick_stage_errors) o.alerts.push('A step of the clock failed (' + x.stage + ', first ' + new Date(x.first_at).toISOString().slice(0, 16).replace('T', ' ') + ' UTC, ' + x.count + ' time' + (x.count === 1 ? '' : 's') + ') and has not run cleanly since: ask support to look at the audit log (tick.stage_error).');
-  if (o.tick_budget_small) { const [need, have] = o.tick_budget_small.split(':'); o.alerts.push('budget_too_small: one visit of the settle needs about ' + need + ' calls and the budget (TICK_QUERY_BUDGET) is ' + have + ': raise it, or run the clock through the signed tick route (docs/DEPLOY.md) which may use a larger allowance.'); }
+  if (o.tick_budget_small) { const [need, have] = o.tick_budget_small.split(':'); o.alerts.push('budget_too_small: the last settle turn could not pay a member: one payment needs about ' + need + ' calls and that turn had ' + have + '. Run the clock through the signed tick route (docs/DEPLOY.md), which gets a larger allowance, or raise TICK_QUERY_BUDGET.'); }
   if (o.tick_backlog > 0 && o.tick_backlog_ticks >= 6) o.alerts.push('The clock is behind: ' + o.tick_backlog + ' reward groups or periods are waiting to be checked and have been for ' + o.tick_backlog_ticks + ' runs. Run the clock more often (docs/DEPLOY.md) or raise TICK_QUERY_BUDGET on a paid plan. Nothing is lost; the newest periods are checked first.');
+  if (o.rows_read_today >= soft) o.alerts.push('rows_read_high: ' + o.rows_read_today + ' rows read today (soft limit ' + soft + '; the free D1 plan stops at 5,000,000 a day and then every query fails until 00:00 UTC). The clock now does only the essential work (sending, releases, the newest periods) until tomorrow. See docs/DEPLOY.md.');
   if (o.tick_stale) o.alerts.push('Nothing has run the full clock for over an hour: set up the scheduler (docs/DEPLOY.md). Without it period bonuses and streaks are not paid (opening the app only moves the light steps).');
   o.alerts.push(...o.warnings);
   return o;
@@ -497,10 +535,12 @@ export async function tick(ctx, company, { limit = 100, only = null, lazy = fals
   delete r._errors;
   return r;
 }
-const LAZY_EVERY = 5 * 60_000, LAZY_MAX_USED = 12, LAZY_BUDGET = 20;
+const LAZY_EVERY = 5 * 60_000, LAZY_MAX_USED = 8, LAZY_BUDGET = 20;
+/** The ONLY routes before which the lazy clock may run: light reads that use a few calls. A heavy route (a list, an event submit) never starts a tick: it would overrun the invocation. */
+const LAZY_ROUTES = new Set(['GET /api/admin/overview', 'GET /api/me']);
 /**
- * A signed-in request may start a TINY tick when none ran for 5 minutes (one winner per window, see the claim). It never settles and never sends: it moves the light stages (releases, approvals, reversals, penalty notices)
- * inside its own small budget, counted against the invocation the request is already using, and is skipped when the request has already used more than LAZY_MAX_USED calls. The heavy work (sending, the period settle) belongs
+ * A signed-in request may start a TINY tick when none ran for 5 minutes (one winner per window, see the claim). It never settles; it moves the light stages (releases, approvals, reversals, penalty notices, and at most a row or two of sending)
+ * inside its own small budget, counted against the invocation the request is already using, and is skipped when the request has already used more than LAZY_MAX_USED (8) calls. It runs only before the routes in LAZY_ROUTES, after the CSRF check. The heavy work (sending, the period settle) belongs
  * to the external driver (docs/DEPLOY.md). A failure never reaches the caller. Not used by signed system calls.
  */
 export async function lazyTick(ctx, company) {
@@ -512,6 +552,24 @@ export async function lazyTick(ctx, company) {
   try { await tick(ctx, company, { limit: 25, lazy: true }); } catch (e) { console.error('lazy tick failed', e?.message); }
   return true;
 }
+
+// ---------- rows read and written per UTC day (the free D1 plan: 5 million read, 100 thousand written; past it every query fails until 00:00 UTC) ----------
+/** Adds the rows this invocation read and wrote since it started (and, from the settle, the old periods it looked at) to today's total in tick_state. One statement. */
+export async function accountRows(ctx, company, { cold = 0, holder = ctx.budget } = {}) {
+  const stats = ctx.rawDb?.stats ?? ctx.db.stats, base = holder?.rows0;
+  if (!stats || !base) return null;
+  const dr = Math.max(0, stats.rowsRead - base.r), dw = Math.max(0, stats.rowsWritten - base.w);
+  holder.rows0 = { r: stats.rowsRead, w: stats.rowsWritten + 1 }; // what is counted now is not counted again (the statement below writes one row)
+  const day = Math.floor(ctx.now() / DAY);
+  await ctx.db.run(`INSERT INTO tick_state (company_id, rows_day, rows_read_day, rows_written_day, cold_day, cold_used) VALUES (?,?,?,?,?,?) ON CONFLICT (company_id) DO UPDATE SET
+    rows_read_day = CASE WHEN tick_state.rows_day = excluded.rows_day THEN tick_state.rows_read_day + excluded.rows_read_day ELSE excluded.rows_read_day END,
+    rows_written_day = CASE WHEN tick_state.rows_day = excluded.rows_day THEN tick_state.rows_written_day + excluded.rows_written_day ELSE excluded.rows_written_day END,
+    rows_day = excluded.rows_day,
+    cold_used = CASE WHEN tick_state.cold_day = excluded.cold_day THEN tick_state.cold_used + excluded.cold_used ELSE excluded.cold_used END,
+    cold_day = CASE WHEN ? > 0 OR tick_state.cold_day = excluded.cold_day THEN excluded.cold_day ELSE tick_state.cold_day END`, company.id, day, dr, dw, day, cold, cold);
+  return { read: dr, written: dw };
+}
+const ROWS_FLUSH = 20_000; // a request that read more than this many rows adds them to today's total itself
 // The stages of the clock. A tick under a query budget (TICK_QUERY_BUDGET, default 40; one worker invocation on a free D1 plan allows 50 queries, a batch counts as one) runs ONE of two turns, so every stage
 // gets a useful share: the CORE turn (sending, releases, approvals, reversals, penalties, orders, AI housekeeping) and the SETTLE turn (the period bonuses). They alternate. A tick with no budget (0) runs everything.
 // The core stages start at a different one each time round and each has a minimum share (a stage that cannot use its share gives it on), so none is starved by another.
@@ -532,6 +590,8 @@ async function tickBody(ctx, company, limit, only = null, { lazy = false, driver
     if (ctx.budget) limitQ = Math.max(4, Math.min(limitQ, invLimit - ctx.budget.used - MARGIN)); // what the request itself already used is not available
   }
   const b = makeBudget(limitQ), t = bounded ? withBudget(ctx, b) : ctx;
+  const holder = ctx.budget ?? ctx.__rows ?? (ctx.__rows = {}); // where this invocation's starting row counts live (handle() sets them; a direct call starts here)
+  { const rs = ctx.rawDb?.stats ?? ctx.db.stats; if (rs && !holder.rows0) holder.rows0 = { r: rs.rowsRead, w: rs.rowsWritten }; }
   const defs = {
     sent: () => R.retryQueued(t, company, limit), released: () => R.releaseWaiting(t, company), resumed: () => E.resumeApproved(t, company),
     reversals: () => E.processReversals(t, company), penalties: () => Pen.tickPenalties(t, company), settled: () => settleCompany(t, company, ctx.now()),
@@ -586,12 +646,13 @@ async function tickBody(ctx, company, limit, only = null, { lazy = false, driver
       if (ranSettle && backlog > 0) budgetHit = true; // work was left for the next turn: the budget (not an error) is why
       const bt = ranSettle ? (backlog > 0 ? (st?.backlog_ticks ?? 0) + 1 : 0) : (st?.backlog_ticks ?? 0);
       const cursor = ranSettle ? (b.settleCursorSet ? (b.settleCursor ?? null) : (st?.settle_cursor ?? null)) : (st?.settle_cursor ?? null);
-      const small = ranSettle ? (configured > 0 && configured < MIN_DRIVER_BUDGET ? MIN_DRIVER_BUDGET + ':' + configured : (b.budgetSmall ?? null)) : (st?.budget_small ?? null);
+      const small = ranSettle ? (b.budgetSmall ?? null) : (st?.budget_small ?? null); // flagged only when a settle turn REALLY could not pay a member for want of calls (a driver tick gets at least MIN_DRIVER_BUDGET, so a small TICK_QUERY_BUDGET alone is no problem)
       const cleanTurn = errored === 0;
       const coreOk = turn === 'core' && cleanTurn ? now : (st?.core_ok_at ?? 0), settleOk = turn === 'settle' && cleanTurn ? now : (st?.settle_ok_at ?? 0);
       await t.db.run('INSERT INTO tick_state (company_id, tick_seq, settle_cursor, backlog, sweep_left, backlog_ticks, budget_at, core_ok_at, settle_ok_at, budget_small) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (company_id) DO UPDATE SET tick_seq = excluded.tick_seq, settle_cursor = excluded.settle_cursor, backlog = excluded.backlog, sweep_left = excluded.sweep_left, backlog_ticks = excluded.backlog_ticks, budget_at = excluded.budget_at, core_ok_at = excluded.core_ok_at, settle_ok_at = excluded.settle_ok_at, budget_small = excluded.budget_small',
         company.id, seq + 1, cursor, backlog, ranSettle ? (b.sweepLeft ?? 0) : (st?.sweep_left ?? 0), bt, budgetHit ? now : (st?.budget_at ?? 0), coreOk, settleOk, small);
       if (!open.length && coreOk >= now - CYCLE_WINDOW && settleOk >= now - CYCLE_WINDOW) await t.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', now, company.id); // fully run: both turns clean, no stage flagged
+      await accountRows(t, company, { cold: ranSettle ? (b.coldRead ?? 0) : 0, holder });
       if (budgetHit && !(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.budget_reached' AND at > ?", company.id, now - DAY))) await commit(t, company.id, 'system', 'tick.budget_reached', { budget: limitQ, backlog });
     } catch { /* the next tick */ }
   } else if (!bounded && !errored && (only || !open.length)) {
@@ -606,7 +667,7 @@ async function tickBody(ctx, company, limit, only = null, { lazy = false, driver
 const SYS = { id: 'api', role: 'system' };
 const ABOVE = (k) => AI.KEY_CLASSES.slice(AI.KEY_CLASSES.indexOf(k));
 const sysRoutes = [
-  ['POST', '/api/ingest/events', ABOVE('event_write'), async (c) => AI.ingestEvents(c.ctx, c.company, SYS, c.body, { allowCancel: true }), 'write', 'ingest.events'],
+  ['POST', '/api/ingest/events', ABOVE('event_write'), async (c) => { const r = await AI.ingestEvents(c.ctx, c.company, SYS, c.body, { allowCancel: true }); return r.deferred ? { ...r, _status: 207 } : r; }, 'write', 'ingest.events'],
   ['POST', '/api/ingest/tick', ABOVE('event_write'), async (c) => tick(c.ctx, c.company, { driver: true, turn: c.body?.turn ?? null }), 'write', 'ingest.tick'],
   ['POST', '/api/webhooks/provider', ['provider_webhook'], async (c) => {
     // Stored first, then answered 200. A daily history check repairs anything missed.
@@ -630,6 +691,7 @@ export const registeredV1Routes = () => [
 export async function handle(ctx0, req, env = {}) {
   // One request is one worker invocation: its database and provider calls are counted from the first one (the lazy tick and the tick routes size themselves from what is left of the invocation's limit).
   const ctx = ctx0.budget ? ctx0 : withBudget(ctx0, makeBudget(0));
+  const rs = ctx.rawDb?.stats ?? ctx.db.stats; if (rs && !ctx.budget.rows0) ctx.budget.rows0 = { r: rs.rowsRead, w: rs.rowsWritten }; // what this invocation reads and writes is counted from here (see accountRows)
   const url = new URL(req.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
   try {
@@ -645,7 +707,8 @@ export async function handle(ctx0, req, env = {}) {
       await AI.enforceSwitches(ctx, company, sys[4], sys[5]); // the Hub and platform switches cover every signed route, not only /api/v1
       const result = await sys[3]({ ctx, company, body: parse(raw), url, env });
       if (AI.isV1Path(req.method, path)) return AI.legacyReply(req.method, path, result);
-      return out(200, { ok: true, ...result });
+      const { _status, ...rest } = result;
+      return out(_status ?? 200, { ok: true, ...rest });
     }
     // platform routes: only with the platform token secret; used to open a company and, later, mark it live. Never to read people data.
     if (path.startsWith('/api/platform/')) {
@@ -677,7 +740,6 @@ export async function handle(ctx0, req, env = {}) {
       const a = await P.authenticate(ctx, c.token);
       if (!a) throw new ApiError(401, 'sign_in', 'Please sign in.');
       c.user = a.user; c.company = a.company;
-      if (!/^[/]api[/]admin[/](tick|settle|seasons)/.test(path)) await lazyTick(ctx, a.company); // the routes that run the clock themselves need the whole invocation
       if (req.method !== 'GET') { // cross-site writes: require our own header, and a same-site Origin when one is sent
         if (req.headers.get('x-floor') !== '1') throw new ApiError(403, 'csrf', 'Missing request header.');
         const o = req.headers.get('origin');
@@ -687,6 +749,8 @@ export async function handle(ctx0, req, env = {}) {
       const o = req.headers.get('origin');
       if (o && !sameOrigin(o, url.host)) throw new ApiError(403, 'csrf', 'Cross-site request refused.');
     }
+    // The lazy clock runs only before a LIGHT read (a few calls) and only when the request has hardly used its invocation yet, and after the CSRF check. Every other route is left alone: the driver does the work.
+    if (!open && LAZY_ROUTES.has(`${req.method} ${path}`)) await lazyTick(ctx, c.company);
     const result = await hit.r.fn(c, hit.m);
     return out(200, { ok: true, ...result }, c.setCookie ? { 'set-cookie': c.setCookie } : {});
   } catch (e) {

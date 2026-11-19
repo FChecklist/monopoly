@@ -3,7 +3,8 @@ import { assertCreditAmount, assertShop, shopOn } from './v1.js';
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
-import { accountRef, retryQueued, releaseSeasonHold, releasePendingHolds } from './rewards.js';
+import { accountRef, retryQueued, releaseSeasonHold, releasePendingHolds, SEND_COST } from './rewards.js';
+import { invocationLimit, ROUTE_MARGIN, BudgetReached } from './budget.js';
 import { intend, intendStmt, run, settleOp, unsettled } from './provider-ops.js';
 import { ProviderError } from './provider/errors.js';
 
@@ -159,7 +160,9 @@ export async function closeSeason(ctx, company, actor, seasonId) {
   const prov = ctx.provider(company);
   // Rewards of this season that are queued (a provider outage kept them) still draw from its hold. Try them once; if any is still on its way
   // the hold stays until the tick has sent them (releaseClosedHolds), so closing a season never turns earned rewards into voids.
-  try { await retryQueued(ctx, company, 1000); } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  // Bounded by what is left of this invocation (one send needs SEND_COST calls; the close itself about 12): rows not sent here keep the season's hold until the tick has sent them (hold_pending).
+  const lim = invocationLimit(ctx.env), tries = Number.isFinite(lim) ? Math.max(0, Math.floor((lim - (ctx.budget?.used ?? 0) - ROUTE_MARGIN - 12) / SEND_COST)) : 1000;
+  if (tries > 0) { try { await retryQueued(ctx, company, Math.min(1000, tries)); } catch (e) { if (!(e instanceof ProviderError) && !(e instanceof BudgetReached)) throw e; } }
   let needRelease = false;
   if ((await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE season_id=? AND state='queued'", s.id)).n > 0) deferred = true;
   else if (s.hold_id && (await prov.capabilities()).hold) needRelease = true;

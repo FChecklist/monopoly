@@ -20,7 +20,7 @@ export function budgetLimit(env) {
 export function budgetDb(db, b) {
   const gate = () => b.gate();
   return {
-    raw: db.raw,
+    raw: db.raw, stats: db.stats,
     async first(...a) { gate(); return db.first(...a); },
     async all(...a) { gate(); return db.all(...a); },
     async run(...a) { gate(); return db.run(...a); },
@@ -52,12 +52,38 @@ export function coalescingDb(db) {
   };
   const add = (sql, p) => new Promise((ok, fail) => { if (!queue.length) queueMicrotask(flush); queue.push({ sql, p, ok, fail }); });
   return {
-    raw: db.raw,
+    raw: db.raw, stats: db.stats,
     first: (sql, ...p) => (isSelect(sql) ? add(sql, p).then((r) => r[0] ?? null) : db.first(sql, ...p)),
     all: (sql, ...p) => (isSelect(sql) ? add(sql, p) : db.all(sql, ...p)),
     run: (...a) => db.run(...a),
     batch: (...a) => db.batch(...a),
     reads: (...a) => db.reads(...a),
     exec: (...a) => db.exec?.(...a),
+  };
+}
+
+// ---------- the invocation limit (routes that do a variable amount of work) ----------
+/** What ONE invocation of the worker may query: INVOCATION_QUERY_LIMIT when set, else 50 (Cloudflare free) unless the deployment says it has no budget (TICK_QUERY_BUDGET=0: paid plan, tests). Infinity = unbounded. */
+export function invocationLimit(env) {
+  const e = Number(env?.INVOCATION_QUERY_LIMIT);
+  if (e > 0) return Math.trunc(e);
+  return budgetLimit(env) <= 0 ? Infinity : 50;
+}
+export const ROUTE_MARGIN = 4; // calls of the invocation a route never uses
+/**
+ * A route that works through a list (event intake, CSV import) asks this gate before each item: the item is started only when the invocation can pay for the
+ * most expensive one seen so far. The first item always runs (so a call always makes progress). Whole items only: an item is never cut in the middle by this gate.
+ */
+export function batchGate(ctx, { estimate = 30, margin = ROUTE_MARGIN } = {}) {
+  const lim = invocationLimit(ctx.env);
+  const used = () => ctx.budget?.used ?? 0;
+  let worst = 0, started = 0, at = 0;
+  return {
+    limit: lim,
+    /** How many items one call can take now (an estimate for the contract: max_per_call). null = no bound. */
+    maxPerCall: () => (Number.isFinite(lim) ? Math.max(1, Math.floor((lim - margin - used()) / estimate)) : null),
+    canTake() { return !Number.isFinite(lim) || started === 0 || lim - margin - used() >= (worst || estimate); },
+    begin() { started++; at = used(); },
+    end() { worst = Math.max(worst, used() - at); },
   };
 }

@@ -6,6 +6,7 @@
 import { ApiError, sha256Hex, hmacHex, safeEqual, clean, MIN, DAY, periodOf, jsonOut, newId, parseBody, clampLimit, normEmail } from './util.js';
 import { settingsOf } from './config.js';
 import { commit } from './audit.js';
+import { batchGate } from './budget.js';
 import { loadCompany } from './ctx.js';
 import { secretOfKey } from './setup.js';
 import * as E from './events.js';
@@ -191,9 +192,10 @@ export const OPERATIONS = [
   {
     id: 'events.submit', method: 'POST', path: '/api/v1/events', scopes: atLeast('event_write'), kind: 'write', money: true, level: 'event_write', askOnly: false, untrusted: [],
     summary: 'Send events (same pipeline as /api/ingest/events)',
-    description: 'Up to 100 events: {events:[{person_id or work_email, event_type, stage, ext_id, occurred_at, value?, dedupe_key?, source?}]}. The same checks, approvals and caps as the older ingest route. Can cause credits to move (x-money true). Not available to ai_read keys.',
+    description: 'Up to 100 events: {events:[{person_id or work_email, event_type, stage, ext_id, occurred_at, value?, dedupe_key?, source?}]}. Each call works through the events until the invocation budget of the worker is used (a free Cloudflare plan allows 50 database queries per call: about 1 to 2 events per call, see docs/DEPLOY.md); the rest is answered with HTTP 207 and {deferred, next_index}: send events[next_index..] again. The same checks, approvals and caps as the older ingest route. Can cause credits to move (x-money true). Not available to ai_read keys.',
     request: { events: [{ person_id: 'u_ab12', event_type: 'game', stage: 'completed', ext_id: 'G-77', occurred_at: 1795000000000 }] },
-    response: { ok: true, results: [{ ext_id: 'G-77', ok: true, id: 'ev_ab12', status: 'applied', approvals_required: 0 }] },
+    response: { ok: true, results: [{ ext_id: 'G-77', ok: true, id: 'ev_ab12', status: 'applied', approvals_required: 0 }], processed: 1, deferred: 0, next_index: null },
+    extraStatus: { 207: 'Partly done: results hold the first `processed` events (each one whole). `deferred` events were NOT started: send events[next_index..] again in a new call with a new Idempotency-Key. `max_per_call` is the number of events one call can take now (absent when unbounded).' },
     errors: ['unsigned', 'bad_signature', 'stale_timestamp', 'replayed', 'rate_limited', 'scope_denied', 'hub_off', 'hub_read_only', 'hub_unreachable', 'hub_action_disabled', 'idempotency_required', 'idempotency_conflict', 'idempotency_in_progress', 'validation', 'bad_json', 'too_big', 'internal'],
   },
   {
@@ -231,16 +233,15 @@ export async function verifySigned(ctx, req, raw) {
   if (!Number.isFinite(t) || Math.abs(ctx.now() - t) > 5 * MIN) throw new ApiError(401, 'stale_timestamp', 'Timestamp is too old or too new.');
   const h = await sha256Hex(keyId + sig);
   try { await ctx.db.run('INSERT INTO replay (sig, ts) VALUES (?,?)', h, t); } catch { throw new ApiError(401, 'replayed', 'This request was already used.'); }
-  await ctx.db.run('DELETE FROM replay WHERE ts < ?', ctx.now() - 15 * MIN);
+  if (parseInt(h.slice(0, 2), 16) < 16) await ctx.db.run('DELETE FROM replay WHERE ts < ?', ctx.now() - 15 * MIN); // housekeeping on one call in sixteen: it need not cost a query every time
   return { key: k, company: await loadCompany(ctx, k.company_id) };
 }
 /** 30 calls a minute for an AI key, 120 for every other class. */
 export async function rateLimit(ctx, key) {
   const limit = key.scope === 'ai_read' ? RATE_LIMITS.ai_read : RATE_LIMITS.other;
   const win = Math.floor(ctx.now() / MIN);
-  await ctx.db.run('INSERT INTO ingest_rate (key_id, window, n) VALUES (?,?,1) ON CONFLICT(key_id, window) DO UPDATE SET n = n + 1', key.key_id, win);
-  const r = await ctx.db.first('SELECT n FROM ingest_rate WHERE key_id = ? AND window = ?', key.key_id, win);
-  await ctx.db.run('DELETE FROM ingest_rate WHERE window < ?', win - 5);
+  const r = await ctx.db.first('INSERT INTO ingest_rate (key_id, window, n) VALUES (?,?,1) ON CONFLICT(key_id, window) DO UPDATE SET n = n + 1 RETURNING n', key.key_id, win); // count and read in ONE statement
+  if (Math.random() < 1 / 16) await ctx.db.run('DELETE FROM ingest_rate WHERE window < ?', win - 5);
   if (r.n > limit) throw new ApiError(429, 'rate_limited', 'Too many calls this minute.', { retry_after: Math.max(1, Math.ceil(((win + 1) * MIN - ctx.now()) / 1000)) });
 }
 
@@ -320,13 +321,23 @@ export async function enforceSwitches(ctx, company, kind, opId, { callerType = '
 // ---------- shared data (the older widget routes use the same functions) ----------
 export async function targetsData(ctx, company) {
   const s = settingsOf(company), now = ctx.now(), rows = [];
-  const ppl = await ctx.db.all("SELECT id FROM app_user WHERE company_id = ? AND status = 'active'", company.id);
-  for (const t of await ctx.db.all('SELECT * FROM period_target WHERE company_id = ?', company.id)) {
-    const p = periodOf(t.period, now, s.fy_start_month), tiers = await tiersOf(ctx, t.id);
-    let hit = 0, total = 0;
-    for (const u of ppl) { const n = await countFor(ctx, company, t, u.id, p.start, p.end); total += n; if (tiers[0] && n >= tiers[0].count) hit++; }
-    rows.push({ id: t.id, name: t.name, period: t.period, period_key: p.key, scope: t.scope, tiers: tiers.map((x) => ({ count: x.count, bonus: x.bonus })), people_on_target: hit, people: ppl.length, events_counted: total });
-  }
+  // Targets, tiers and the people count in one round trip; one grouped count per target (never one query per person), in batches.
+  const [targets, tiers, [{ n: people }]] = await ctx.db.reads([
+    ['SELECT * FROM period_target WHERE company_id = ?', company.id],
+    ['SELECT t.* FROM tier t JOIN period_target pt ON pt.id = t.target_id WHERE pt.company_id = ? ORDER BY t.target_id, t.idx', company.id],
+    ["SELECT COUNT(*) n FROM app_user WHERE company_id = ? AND status = 'active'", company.id],
+  ]);
+  const stmts = targets.map((t) => {
+    const p = periodOf(t.period, now, s.fy_start_month), start = t.active_from ? Math.max(p.start, t.active_from) : p.start;
+    return { t, p, q: ["SELECT person_id, COUNT(*) n FROM event WHERE company_id = ? AND event_type = ? AND stage = ? AND status IN ('applied','reversal_pending') AND occurred_at >= ? AND occurred_at < ? AND person_id IN (SELECT id FROM app_user WHERE company_id = ? AND status = 'active') GROUP BY person_id", company.id, t.event_type, t.stage, start, p.end, company.id] };
+  });
+  const counts = [];
+  for (let i = 0; i < stmts.length; i += 60) counts.push(...await ctx.db.reads(stmts.slice(i, i + 60).map((x) => x.q)));
+  stmts.forEach(({ t, p }, i) => {
+    const ts = tiers.filter((x) => x.target_id === t.id);
+    const total = counts[i].reduce((a, r) => a + r.n, 0), hit = ts[0] ? counts[i].filter((r) => r.n >= ts[0].count).length : 0;
+    rows.push({ id: t.id, name: t.name, period: t.period, period_key: p.key, scope: t.scope, tiers: ts.map((x) => ({ count: x.count, bonus: x.bonus })), people_on_target: hit, people, events_counted: total });
+  });
   return rows;
 }
 export async function achievementsData(ctx, company) {
@@ -344,17 +355,27 @@ export async function boardNumbers(ctx, company) {
 export async function ingestEvents(ctx, company, actor, body, { allowCancel = true } = {}) {
   const items = Array.isArray(body.events) ? body.events.slice(0, 100) : [];
   const results = [];
-  for (const e of items) {
-    if (!e || typeof e !== 'object') { results.push({ ok: false, reason: 'missing_fields' }); continue; }
-    if (e.action === 'cancel') {
-      if (!allowCancel) { results.push({ ext_id: e.ext_id, ok: false, reason: 'use_cancel_route' }); continue; }
-      results.push(await cancelOne(ctx, company, actor, e));
-      continue;
-    }
-    try { results.push({ ext_id: e.ext_id, ...(await E.submitEvent(ctx, company, actor, { ...e, source: e.source === 'game' ? 'game' : 'api' })) }); }
-    catch (err) { results.push({ ext_id: e.ext_id, ok: false, reason: err.code ?? 'error' }); }
+  const gate = batchGate(ctx);
+  const memo = new Map(); // team, season, rate card and rules are read once for the whole call
+  const maxPerCall = gate.maxPerCall();
+  let i = 0;
+  for (; i < items.length; i++) {
+    if (!gate.canTake()) break; // the rest is deferred: the caller sends it again (whole events only, nothing is half done)
+    const e = items[i];
+    gate.begin();
+    try {
+      if (!e || typeof e !== 'object') { results.push({ ok: false, reason: 'missing_fields' }); continue; }
+      if (e.action === 'cancel') {
+        if (!allowCancel) { results.push({ ext_id: e.ext_id, ok: false, reason: 'use_cancel_route' }); continue; }
+        results.push(await cancelOne(ctx, company, actor, e));
+        continue;
+      }
+      try { results.push({ ext_id: e.ext_id, ...(await E.submitEvent(ctx, company, actor, { ...e, source: e.source === 'game' ? 'game' : 'api' }, { memo })) }); }
+      catch (err) { results.push({ ext_id: e.ext_id, ok: false, reason: err.code ?? 'error' }); }
+    } finally { gate.end(); }
   }
-  return { results };
+  const deferred = items.length - i;
+  return { results, processed: i, deferred, next_index: deferred ? i : null, ...(maxPerCall ? { max_per_call: maxPerCall } : {}) };
 }
 export async function cancelOne(ctx, company, actor, e) {
   try {
@@ -583,7 +604,7 @@ export const HANDLERS = {
   },
   'board.summary': async (c) => ({
     ok: true, v: 1, ...(await boardNumbers(c.ctx, c.company)),
-    teams: await Promise.all((await c.ctx.db.all('SELECT id, name FROM team WHERE company_id = ? ORDER BY name LIMIT 100', c.company.id)).map(async (t) => ({ name: t.name, members: (await c.ctx.db.first("SELECT COUNT(*) n FROM app_user WHERE team_id = ? AND status = 'active'", t.id)).n }))),
+    teams: await c.ctx.db.all("SELECT t.name, COUNT(u.id) members FROM team t LEFT JOIN app_user u ON u.team_id = t.id AND u.status = 'active' WHERE t.company_id = ? GROUP BY t.id ORDER BY t.name LIMIT 100", c.company.id), // one query, not one per team
     surprise_notes: (await c.ctx.db.all("SELECT text, effect FROM note_card WHERE company_id = ? AND kind = 'note' ORDER BY order_no LIMIT 50", c.company.id)),
   }),
   'targets.list': async (c) => ({ ok: true, v: 1, period_note: 'Counts are for the current period of each target.', targets: await targetsData(c.ctx, c.company) }),
@@ -593,7 +614,8 @@ export const HANDLERS = {
   'proposals.create': createProposal,
   'events.submit': async (c) => {
     if (!Array.isArray(c.body.events) || !c.body.events.length) throw bad('Send {events:[...]} with at least one event.');
-    return { ok: true, ...(await ingestEvents(c.ctx, c.company, c.actor, c.body, { allowCancel: false })) };
+    const out = { ok: true, ...(await ingestEvents(c.ctx, c.company, c.actor, c.body, { allowCancel: false })) };
+    return out.deferred ? { status: 207, body: out } : out; // 207: the first `processed` events are done; send events[next_index..] again (with a new Idempotency-Key)
   },
   'events.cancel': async (c) => {
     const items = Array.isArray(c.body.cancels) ? c.body.cancels.slice(0, 100) : [c.body];
@@ -627,7 +649,7 @@ export function v1Error(e) { const eb = errorBody(e); return reply(eb.status, eb
 /** Every /api/v1 path, the older widget paths included: all of them carry meta and x-content-trust, because company-written text can appear in any of them. */
 export const isV1Path = (method, path) => path.startsWith('/api/v1/');
 /** The answer for a successful older (legacy) /api/v1 route served by api.js: the old fields, plus meta and x-content-trust. */
-export function legacyReply(method, path, result) { const op = OPERATIONS.find((o) => o.legacy && o.method === method && opRe(o).test(path)); return reply(200, { ok: true, ...result }, op ?? null); }
+export function legacyReply(method, path, result) { const op = OPERATIONS.find((o) => o.legacy && o.method === method && opRe(o).test(path)); const { _status, ...rest } = result; return reply(_status ?? 200, { ok: true, ...rest }, op ?? null); }
 
 /** Returns a Response for a /api/v1 path, or null when the path belongs to an older route that api.js still serves. */
 export async function handleV1(ctx, req, path, raw) {
@@ -721,6 +743,7 @@ export function buildOpenApi() {
       ],
       responses: {
         [String(op.httpStatus ?? 200)]: { description: op.httpStatus === 202 ? 'Accepted: pending a human decision. Nothing was done.' : 'OK', headers: { 'x-content-trust': { schema: { type: 'string' }, description: 'Always untrusted-data on every /api/v1 path, the older widget routes included.' } }, content: { 'application/json': { schema: { type: 'object' }, example: { ...op.response, ...{ meta: trustMeta(op) } } } } },
+        ...Object.fromEntries(Object.entries(op.extraStatus ?? {}).map(([k, v]) => [k, { description: v }])),
         ...errResp(op.errors),
       },
     };

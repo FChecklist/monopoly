@@ -6,6 +6,7 @@ import { MAX_SINGLE_CREDIT } from './v1.js';
 import { grant, reverseReward, seasonAt, capOf, voidFailedReward } from './rewards.js';
 import { moveToken, die, bonusPct } from './board.js';
 import { proposePenalty } from './penalty.js';
+import { batchGate } from './budget.js';
 
 const SOURCES = ['manual', 'csv', 'api', 'game', 'request'];
 const SYSTEM_SOURCES = ['api', 'game'];
@@ -28,8 +29,9 @@ async function teamOf(ctx, person) {
  * Submit one event. Returns { ok, status, id?, reason? }. A rejected event is not stored (it never counted) except
  * duplicates, which are only reported. `actor` is the app_user row (or {role:'system', id:'api'} for a signed system).
  */
-export async function submitEvent(ctx, company, actor, input) {
+export async function submitEvent(ctx, company, actor, input, opts = {}) {
   const s = settingsOf(company);
+  const memo = opts.memo ?? new Map(); // rows that cannot change inside one call (team, season, rate card): a batch reads each only once
   const source = SOURCES.includes(input.source) ? input.source : 'manual';
   const type = clean(input.event_type, 60), stage = clean(input.stage, 40);
   let ext = clean(input.ext_id, 120);
@@ -46,7 +48,25 @@ export async function submitEvent(ctx, company, actor, input) {
   else if (input.work_email) person = await ctx.db.first("SELECT * FROM app_user WHERE email_hash = ? AND company_id = ? AND status = 'active'", await ctx.hash('email', normEmail(input.work_email)), company.id);
   else if (input.work_id) person = await ctx.db.first("SELECT * FROM app_user WHERE company_id = ? AND status = 'active' AND work_id_hash = ?", company.id, await ctx.hash('workid', clean(input.work_id, 60))).catch(() => null);
   if (!person) return { ok: false, reason: 'unknown_person' };
-  const team = await teamOf(ctx, person);
+  // ONE round trip for everything the checks below need (team, season, rate card, duplicate, daily count); each answer is used in the same order as before.
+  const dayAgo = ctx.now() - DAY;
+  const stableKeys = { team: person.team_id ? 'team:' + person.team_id : null, season: 'season:' + at, card: `card:${type}:${stage}:${at}` };
+  const want = [];
+  const put = (k, sql, ...p) => { want.push([k, [sql, ...p]]); };
+  if (stableKeys.team && !memo.has(stableKeys.team)) put('team', 'SELECT * FROM team WHERE id = ?', person.team_id);
+  if (!memo.has(stableKeys.season)) put('season', "SELECT * FROM season WHERE company_id = ? AND status = 'published' AND starts_at <= ? AND ends_at > ? ORDER BY starts_at DESC LIMIT 1", company.id, at, at);
+  if (!memo.has(stableKeys.card)) put('card', 'SELECT * FROM rate_card WHERE company_id=? AND event_type=? AND stage=? AND active_from <= ? AND (active_to IS NULL OR active_to > ?) ORDER BY version DESC LIMIT 1', company.id, type, stage, at, at);
+  put('dupe', 'SELECT id, status, person_id FROM event WHERE company_id=? AND event_type=? AND ext_id=? AND stage=?', company.id, type, ext, stage);
+  put('today', "SELECT COUNT(*) n FROM event WHERE company_id=? AND person_id=? AND created_at >= ? AND status != 'rejected'", company.id, person.id, dayAgo);
+  const dedupe0 = input.dedupe_key ? await ctx.hash('lead:' + company.id, clean(input.dedupe_key, 200).toLowerCase()) : null;
+  if (dedupe0) put('dup', "SELECT id FROM event WHERE company_id=? AND event_type=? AND dedupe_hash=? AND status NOT IN ('rejected','reversed') AND created_at > ?", company.id, type, dedupe0, ctx.now() - s.dedupe_window_days * DAY);
+  const got = await ctx.db.reads(want.map((w) => w[1]));
+  const pre = {};
+  want.forEach((w, i) => { pre[w[0]] = got[i][0] ?? null; });
+  if ('team' in pre) memo.set(stableKeys.team, pre.team);
+  if ('season' in pre) memo.set(stableKeys.season, pre.season);
+  if ('card' in pre) memo.set(stableKeys.card, pre.card);
+  const team = stableKeys.team ? memo.get(stableKeys.team) : null;
 
   // Who may enter it?
   if (actor.role === 'employee') {
@@ -60,36 +80,32 @@ export async function submitEvent(ctx, company, actor, input) {
   const finalSource = actor.role === 'employee' ? 'request' : source;
 
   // 2. Inside a published season?
-  const season = await seasonAt(ctx, company.id, at);
+  const season = memo.get(stableKeys.season);
   if (!season) return { ok: false, reason: 'outside_season' };
   // 3. Rate card for this type and stage?
-  const card = await cardFor(ctx, company.id, type, stage, at);
+  const card = memo.get(stableKeys.card);
   if (!card) return { ok: false, reason: 'no_rate_card' };
   if (card.state_needed === 'system' && !sysSource) return { ok: false, reason: 'needs_system_source' };
   // 4. Duplicate?
-  const dupe = await ctx.db.first('SELECT id, status, person_id FROM event WHERE company_id=? AND event_type=? AND ext_id=? AND stage=?', company.id, type, ext, stage);
+  const dupe = pre.dupe;
   if (dupe) {
     // Resumable: the event was stored but applying it did not finish (status still 'approved', e.g. the provider was down).
     // Sending the same event again finishes the job instead of reporting a dead-end duplicate. Anything else is a plain duplicate.
     if (dupe.status === 'approved' && dupe.person_id === person.id) {
-      await applyEvent(ctx, company, dupe.id);
+      await applyEvent(ctx, company, dupe.id, { memo });
       const ev = await ctx.db.first('SELECT status, approvals_required FROM event WHERE id = ?', dupe.id);
       return { ok: true, id: dupe.id, status: ev.status, approvals_required: ev.approvals_required, resumed: true };
     }
     return { ok: false, reason: 'duplicate', existing_id: dupe.id };
   }
   // Unique-lead check at the first stage: a keyed hash of the prospect, never the prospect's details.
-  let dedupe = null;
+  let dedupe = dedupe0;
   // At the first stage a person's own request must name the prospect (a keyed hash is stored), or it could be repeated forever.
   if (actor.role === 'employee' && card.stage_no === 1 && !clean(input.dedupe_key, 200)) return { ok: false, reason: 'dedupe_key_required' };
-  if (input.dedupe_key) {
-    dedupe = await ctx.hash('lead:' + company.id, clean(input.dedupe_key, 200).toLowerCase());
-    const dup = await ctx.db.first("SELECT id FROM event WHERE company_id=? AND event_type=? AND dedupe_hash=? AND status NOT IN ('rejected','reversed') AND created_at > ?", company.id, type, dedupe, ctx.now() - s.dedupe_window_days * DAY);
-    if (dup && card.stage_no === 1) return { ok: false, reason: 'duplicate_lead' };
-  }
+  if (input.dedupe_key && pre.dup && card.stage_no === 1) return { ok: false, reason: 'duplicate_lead' };
   // 5. Plausible? Too many in a day is held for a person to look at.
   const dayStart = at - (at % DAY);
-  const today = (await ctx.db.first("SELECT COUNT(*) n FROM event WHERE company_id=? AND person_id=? AND created_at >= ? AND status != 'rejected'", company.id, person.id, ctx.now() - DAY)).n;
+  const today = pre.today.n;
   let status = 'pending', approvals = 1, held = false;
   if (today >= s.daily_event_limit) { held = true; status = 'held'; }
   // 6. Trust level decides who must approve.
@@ -119,9 +135,12 @@ export async function submitEvent(ctx, company, actor, input) {
     if (/UNIQUE/i.test(String(e?.message)) && /event/i.test(String(e?.message))) return { ok: false, reason: 'duplicate' };
     throw e;
   }
-  if (status === 'approved') await applyEvent(ctx, company, id);
-  const ev = await ctx.db.first('SELECT status FROM event WHERE id = ?', id);
-  return { ok: true, id, status: ev.status, approvals_required: approvals };
+  if (status === 'approved') {
+    const row = { id, company_id: company.id, person_id: person.id, submitted_by: actor.id, source: finalSource, event_type: type, stage, ext_id: ext, occurred_at: at, value, status, approvals_required: approvals, rate_card_id: card.id, season_id: season.id, meta, created_at: ctx.now() };
+    const done = await applyEvent(ctx, company, id, { memo, pre: { ev: row, card, person, season } });
+    return { ok: true, id, status: done ? 'applied' : 'approved', approvals_required: approvals }; // applyEvent answers null while the event is not decided yet
+  }
+  return { ok: true, id, status, approvals_required: approvals }; // nothing happened after the insert: the status is the one just written
 }
 
 export async function approveEvent(ctx, company, actor, eventId) {
@@ -163,13 +182,18 @@ export async function rejectEvent(ctx, company, actor, eventId, reason) {
 }
 
 /** Pay and move for an approved event. Safe to run twice: rewards, moves and penalty proposals are idempotent. */
-export async function applyEvent(ctx, company, eventId) {
-  const ev = await ctx.db.first('SELECT * FROM event WHERE id = ?', eventId);
-  if (!ev || !['approved', 'applied'].includes(ev.status)) return null;
+export async function applyEvent(ctx, company, eventId, opts = {}) {
+  const pre = opts.pre; // rows the caller has just read or written (submitEvent): no need to read them again
+  const memo = opts.memo ?? new Map();
+  let ev, card, person, season;
+  if (pre) ({ ev, card, person, season } = pre);
+  else {
+    ev = await ctx.db.first('SELECT * FROM event WHERE id = ?', eventId);
+    if (!ev || !['approved', 'applied'].includes(ev.status)) return null;
+    const [[c0], [p0], [s0]] = await ctx.db.reads([['SELECT * FROM rate_card WHERE id = ?', ev.rate_card_id], ['SELECT * FROM app_user WHERE id = ?', ev.person_id], ['SELECT * FROM season WHERE id = ?', ev.season_id]]);
+    card = c0; person = p0; season = s0;
+  }
   const s = settingsOf(company);
-  const card = await ctx.db.first('SELECT * FROM rate_card WHERE id = ?', ev.rate_card_id);
-  const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', ev.person_id);
-  const season = await ctx.db.first('SELECT * FROM season WHERE id = ?', ev.season_id);
   let meta = {};
   try { meta = JSON.parse(ev.meta || '{}') ?? {}; } catch { meta = {}; }
   const out = { paid: 0, bonus: 0 };
@@ -178,7 +202,7 @@ export async function applyEvent(ctx, company, eventId) {
     // Dice bonus: base and the TOP of the bonus range are reserved together, so the bonus can never be left waiting for budget.
     const top = dice ? Math.min(company.provider === 'moneypenny' ? MAX_SINGLE_CREDIT : Infinity, Math.max(1, Math.ceil((card.credits * s.bonus_max_pct) / 100))) : 0; // a dice bonus is one credit: never above the provider's single maximum
     const g = await grant(ctx, company, {
-      person, kind: 'event', amount: card.credits, idem: `event:${ev.id}:${ev.stage}`, groupKey: `card:${ev.event_type}:${ev.stage}`,
+      person, season, kind: 'event', amount: card.credits, idem: `event:${ev.id}:${ev.stage}`, groupKey: `card:${ev.event_type}:${ev.stage}`,
       at: ev.occurred_at, eventId: ev.id, card, capMonth: card.cap_month, capDay: card.cap_day,
       // Only the system's own two-approver rule (backdated or big) lifts the per-event cap, never a typed-in min_approvals.
       capEvent: meta.rule2 ? 0 : capOf(s, 'cap_event'), reserve: top, actor: 'system', // a 0 or junk cap_event falls back to the default; only the system's two-approver rule lifts it
@@ -190,15 +214,17 @@ export async function applyEvent(ctx, company, eventId) {
       const d = await die(ctx, person.id, ev.id, 99);
       const pct = bonusPct(s.bonus_floor_pct, s.bonus_max_pct, d);
       const bonus = Math.min(top, Math.max(1, Math.floor((g.paid * pct) / 100)));
-      const b = await grant(ctx, company, { person, kind: 'bonus_roll', amount: bonus, idem: `bonus:${ev.id}:${ev.stage}`, groupKey: `bonus:${ev.event_type}:${ev.stage}`, at: ev.occurred_at, eventId: ev.id, card, actor: 'system' });
+      const b = await grant(ctx, company, { person, season, kind: 'bonus_roll', amount: bonus, idem: `bonus:${ev.id}:${ev.stage}`, groupKey: `bonus:${ev.event_type}:${ev.stage}`, at: ev.occurred_at, eventId: ev.id, card, actor: 'system' });
       if (b.reason === 'busy') return null;
       out.bonus = b.paid; out.roll = { die: d, pct };
     }
   }
-  const mv = await moveToken(ctx, company, { person, event: ev, card, season });
+  const mv = await moveToken(ctx, company, { person, event: ev, card, season, memo });
   // A rule that removes anything is never applied by a signed system: it only creates a proposed penalty for HR.
   // One bad rule (no acknowledgement yet, credit loss switched off, ...) is skipped; it never stops the event or the tick.
-  for (const pr of await ctx.db.all('SELECT * FROM penalty_rule WHERE company_id = ? AND event_type = ? AND active = 1 AND published_at IS NOT NULL AND published_at <= ?', company.id, ev.event_type, ev.occurred_at)) {
+  const ruleKey = `rules:${ev.event_type}`;
+  if (!memo.has(ruleKey)) memo.set(ruleKey, await ctx.db.all('SELECT * FROM penalty_rule WHERE company_id = ? AND event_type = ? AND active = 1 AND published_at IS NOT NULL', company.id, ev.event_type));
+  for (const pr of memo.get(ruleKey).filter((r) => r.published_at <= ev.occurred_at)) {
     try {
       await proposePenalty(ctx, company, { id: 'system', role: 'system' }, { person_id: person.id, effect: pr.effect, amount: pr.amount, reason: `Rule for ${ev.event_type}`, event_id: ev.id }, { fromRule: pr.id });
     } catch (e) { out.skipped_rules = (out.skipped_rules ?? 0) + 1; }
@@ -332,26 +358,62 @@ export function parseCsv(text, maxRows = 2000) {
   return rows.slice(1).map((r) => Object.fromEntries(head.map((h, i) => [h, defuse((r[i] ?? '').trim())])));
 }
 
-/** CSV intake: always a preview first. commit=false changes nothing. Over the limit, every row needs a second approver. */
-export async function importCsv(ctx, company, actor, text, { commit: doCommit = false } = {}) {
+/** Rate cards and people of a whole file in a FEW round trips (never one query per row): cards by (type, stage) and picked by date here, people by e-mail hash in lists. */
+async function planCsvRows(ctx, company, rows) {
+  const combos = new Map(), hashes = new Map(); // key -> [type, stage] ; normalised e-mail -> hash
+  for (const r of rows) {
+    combos.set(JSON.stringify([r.event_type, r.stage]), [r.event_type, r.stage]);
+    if (r.work_email) { const n = normEmail(r.work_email); if (!hashes.has(n)) hashes.set(n, await ctx.hash('email', n)); }
+  }
+  const stmts = [], kinds = [];
+  for (const [k, [t, st]] of combos) { stmts.push(['SELECT * FROM rate_card WHERE company_id = ? AND event_type = ? AND stage = ?', company.id, t ?? '', st ?? '']); kinds.push(['card', k]); }
+  const hs = [...new Set(hashes.values())];
+  for (let i = 0; i < hs.length; i += 80) { const part = hs.slice(i, i + 80); stmts.push([`SELECT id, email_hash FROM app_user WHERE company_id = ? AND email_hash IN (${part.map(() => '?').join(',')})`, company.id, ...part]); kinds.push(['person', null]); }
+  const cards = new Map(), byHash = new Map();
+  for (let i = 0; i < stmts.length; i += 60) { // one batch holds up to 60 statements
+    const got = await ctx.db.reads(stmts.slice(i, i + 60));
+    got.forEach((rowsOf, j) => { const [kind, k] = kinds[i + j]; if (kind === 'card') cards.set(k, rowsOf); else for (const u of rowsOf) byHash.set(u.email_hash, u.id); });
+  }
+  const pick = (r, at) => (cards.get(JSON.stringify([r.event_type, r.stage])) ?? []).filter((c) => c.active_from <= at && (c.active_to === null || c.active_to > at)).sort((x, y) => y.version - x.version)[0] ?? null;
+  return { pick, personOf: (r) => (r.work_email ? byHash.get(hashes.get(normEmail(r.work_email))) ?? null : null) };
+}
+
+/**
+ * CSV intake: always a preview first. commit=false changes nothing. Over the limit, every row needs a second approver.
+ * A commit works through the rows until the invocation budget is used and answers { more: true, next_row }: the caller sends the SAME file again with from_row = next_row
+ * (rows already done are skipped, and a row sent twice is only reported as a duplicate). Every row is entered whole or not at all.
+ */
+export async function importCsv(ctx, company, actor, text, { commit: doCommit = false, fromRow = 0 } = {}) {
   const s = settingsOf(company);
   const rows = parseCsv(text, s.csv_max_rows);
   const report = { rows: rows.length, accepted: 0, rejected: [], total_credits: 0 };
   const plan = [];
+  const { pick, personOf } = await planCsvRows(ctx, company, rows);
   for (const [i, r] of rows.entries()) {
     const at = r.occurred_at ? Date.parse(r.occurred_at) : ctx.now();
-    const card = await cardFor(ctx, company.id, r.event_type, r.stage, at);
-    const person = r.work_email ? await ctx.db.first('SELECT id FROM app_user WHERE email_hash = ? AND company_id = ?', await ctx.hash('email', normEmail(r.work_email)), company.id) : null;
-    if (!card || !person) { report.rejected.push({ row: i + 2, reason: !person ? 'unknown_person' : 'no_rate_card' }); continue; }
+    const card = pick(r, at);
+    const personId = personOf(r);
+    if (!card || !personId) { report.rejected.push({ row: i + 2, reason: !personId ? 'unknown_person' : 'no_rate_card' }); continue; }
     report.accepted++; report.total_credits += card.credits;
-    plan.push({ ...r, person_id: person.id, occurred_at: at, source: 'csv' });
+    plan.push({ ...r, person_id: personId, occurred_at: at, source: 'csv', _row: i + 2 });
   }
   report.needs_second_person = report.total_credits > s.second_approver_over * 5;
   if (!doCommit) return { ...report, committed: false };
   report.results = [];
+  const gate = batchGate(ctx), memo = new Map();
+  const start = Math.max(0, Math.trunc(Number(fromRow)) || 0);
+  report.max_per_call = gate.maxPerCall();
+  report.more = false; report.next_row = null;
   for (const e of plan) {
-    const out = await submitEvent(ctx, company, actor, { ...e, min_approvals: report.needs_second_person ? 2 : 0 });
-    report.results.push({ ext_id: e.ext_id, ok: out.ok, reason: out.reason, status: out.status });
+    if (e._row < start) continue;
+    if (!gate.canTake()) { report.more = true; report.next_row = e._row; break; }
+    gate.begin();
+    try {
+      const { _row, ...ev } = e;
+      const out = await submitEvent(ctx, company, actor, { ...ev, min_approvals: report.needs_second_person ? 2 : 0 }, { memo });
+      report.results.push({ ext_id: e.ext_id, ok: out.ok, reason: out.reason, status: out.status });
+    } finally { gate.end(); }
   }
+  if (report.max_per_call === null) delete report.max_per_call;
   return { ...report, committed: true };
 }

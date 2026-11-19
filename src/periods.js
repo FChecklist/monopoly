@@ -155,10 +155,17 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
     const stale = fresh ? 0 : (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n * (futureOn(ctx.env, company) ? 1 : 0); // v1: a failed period row is never re-sent by itself (needs an admin) // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
     const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && await quickRetryDue(ctx, company, person, groupKey) ? `:x${stale}` : '');
-    const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system', paidGuard: { paid } });
+    // A first payment (fresh: the caller read that the group has no row at all) carries that fact INTO the insert: if ANY row of the group (a failed, void or reissued one included) appeared meanwhile, nothing is written and the caller reads again.
+    const noRows = fresh ? { sql: 'NOT EXISTS (SELECT 1 FROM reward WHERE company_id = ? AND person_id = ? AND group_key = ?)', params: [company.id, person.id, groupKey] } : null;
+    const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system', paidGuard: { paid }, ...(noRows ? { alsoGuard: noRows } : {}) });
     if (g.reason === 'stale') { out.stale = true; return out; }
     out.paid = g.paid;
     if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';
+    // the fast path skipped the reads that list an undelivered group: do it now (one cheap statement), so the group shows as owed at once
+    if (fresh && !futureOn(ctx.env, company)) {
+      const delivered = g.failed || g.reason === 'failed_before' ? 0 : (g.reward?.state === 'sent' && g.reward.sent_amount < g.reward.amount ? g.reward.sent_amount : g.paid);
+      if (entitled - delivered > 0 && delivered < entitled && (g.failed || g.reason === 'failed_before' || (g.reward && g.reward.sent_amount < g.reward.amount))) await markGroupOwed(ctx, company.id, person.id, groupKey, entitled - delivered);
+    }
   }
   return out;
 }

@@ -59,3 +59,26 @@ export async function verifyChain(db, companyId) {
   }
   return { ok: true, rows: rows.length };
 }
+
+/** Several audit lines (same actor) in ONE batch: the tip is read once and the lines are chained in order. Retries like commit() when another writer took a number. */
+export async function commitMany(ctx, companyId, actor, lines) {
+  if (!lines.length) return [];
+  for (let i = 0; i < 10; i++) {
+    const last = await ctx.db.first('SELECT n, hash FROM audit WHERE company_id = ? ORDER BY n DESC LIMIT 1', companyId);
+    let n = last?.n ?? 0, prev = last?.hash ?? GENESIS;
+    const rows = [];
+    for (const { action, data } of lines) {
+      n++;
+      const body = JSON.stringify(scrubAudit(data ?? {}));
+      const at = ctx.now();
+      const hash = await sha256Hex([prev, n, actor ?? '', action, body, at].join('|'));
+      rows.push(['INSERT INTO audit (company_id, n, actor, action, data, prev_hash, hash, at) VALUES (?,?,?,?,?,?,?,?)', companyId, n, actor ?? null, action, body, prev, hash, at]);
+      prev = hash;
+    }
+    try { return await ctx.db.batch(rows); } catch (e) {
+      if (!/audit/i.test(String(e?.message)) || !/UNIQUE|constraint|PRIMARY/i.test(String(e?.message))) throw e;
+      await new Promise((r) => setTimeout(r, 1 + Math.floor(Math.random() * 4 * (i + 1))));
+    }
+  }
+  throw new Error('audit chain is busy');
+}

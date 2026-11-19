@@ -25,11 +25,11 @@ export const bonusPct = (floor, max, d) => floor + Math.round(((max - floor) * (
 const levelOf = (laps) => Math.min(LEVEL_NAMES.length, 1 + Math.floor(laps / 3));
 
 /** Move a token for one approved event. Safe to repeat for the same event. */
-export async function moveToken(ctx, company, { person, event, card, season }) {
+export async function moveToken(ctx, company, { person, event, card, season, memo }) {
   const s = settingsOf(company);
-  const seen = await ctx.db.first('SELECT * FROM move_log WHERE event_id = ?', event.id);
+  const [[seen], [b0]] = await ctx.db.reads([['SELECT * FROM move_log WHERE event_id = ?', event.id], ['SELECT * FROM board_state WHERE person_id = ? AND company_id = ?', person.id, company.id]]);
   if (seen) return { replay: true, move: seen };
-  const b = await ensureBoard(ctx, company, person.id);
+  const b = b0 ?? await ensureBoard(ctx, company, person.id);
   const effects = [];
   const dice = [];
   let steps = 0, pos = b.position, points = b.points, laps = b.laps, skip = b.skip_roll, lane = b.in_lane, noteCtr = b.note_ctr;
@@ -59,7 +59,8 @@ export async function moveToken(ctx, company, { person, event, card, season }) {
     const sq = SQUARES[pos];
     effects.push({ t: 'land', square: sq.name, type: sq.type });
     if (sq.type === 'note' && s.cards_on) {
-      const cards = await ctx.db.all("SELECT * FROM note_card WHERE company_id = ? AND kind = 'note' ORDER BY order_no, id", company.id);
+      const cards = memo?.get('notecards') ?? await ctx.db.all("SELECT * FROM note_card WHERE company_id = ? AND kind = 'note' ORDER BY order_no, id", company.id);
+      memo?.set('notecards', cards);
       if (cards.length) {
         const c = cards[noteCtr % cards.length]; noteCtr += 1;
         effects.push({ t: 'note', text: c.text, effect: c.effect, amount: c.amount });

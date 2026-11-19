@@ -76,7 +76,7 @@ export async function grant(ctx, company, p) {
   if (p.person?.erased_at) return { paid: 0, reason: 'person_erased' }; // an erased leaver is never paid: nothing is promised
   // Credits handed back (penalty_return) never wait for a season or budget and never count against them: they are the person's own credits.
   const exempt = p.kind === 'penalty_return';
-  const season = exempt ? null : await seasonAt(ctx, company.id, p.at);
+  const season = exempt ? null : (p.season && p.season.starts_at <= p.at && p.season.ends_at > p.at ? p.season : await seasonAt(ctx, company.id, p.at)); // the caller may hand over the season it just read
   const mk = monthKey(p.at), dk = dayKey(p.at);
   const reserve = Math.max(0, p.reserve | 0);
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -95,7 +95,11 @@ export async function grant(ctx, company, p) {
       if (season) caps.push({ name: 'season_cap', cap: capOf(s, 'cap_person_season'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND season_id=? AND state IN ${COUNT}`, params: [company.id, p.person.id, season.id] });
       if (p.periodBonus) caps.push({ name: 'period_bonus_cap', cap: capOf(s, 'cap_period_bonus_person_period'), sql: `SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND period_key=? AND (kind IN ('tier','streak','team') OR (kind = 'reversal' AND substr(group_key, 1, instr(group_key, ':') - 1) IN ('tier','streak','team'))) AND state IN ${COUNT}`, params: [company.id, p.person.id, p.periodKey ?? ''] });
     }
-    for (const c of caps) clamp(c.cap, await one(ctx, c.sql, ...c.params), c.name);
+    // Every 'what is used' sum and the funded total in ONE round trip.
+    const fundedWanted = !exempt && !!season;
+    const sums = await ctx.db.reads([...caps.map((c) => [c.sql, ...c.params]), ...(fundedWanted ? [[fundedSql, company.id, season.id]] : [])]);
+    const val = (rows) => Object.values(rows[0] ?? { v: 0 })[0] ?? 0;
+    caps.forEach((c, i) => clamp(c.cap, val(sums[i]), c.name));
     if (room <= 0) return { paid: 0, reason: why[0] ?? 'cap_reached' };
     const amount = room;
 
@@ -104,7 +108,7 @@ export async function grant(ctx, company, p) {
     if (exempt) state = 'queued';
     else if (!season) state = 'waiting';
     else {
-      funded = await one(ctx, fundedSql, company.id, season.id);
+      funded = val(sums[caps.length]);
       if (funded + amount + reserve - (p.freed | 0) > season.budget) state = 'waiting'; // freed: what the closed old row gives back in the same batch
     }
     if (p.requireQueued && state !== 'queued') return { paid: 0, reason: 'not_payable' }; // a re-issue never creates a row that would only wait
@@ -147,7 +151,7 @@ export async function grant(ctx, company, p) {
     }
     const reward = await ctx.db.first('SELECT * FROM reward WHERE id = ?', id);
     if (state === 'queued') {
-      const sentRow = await sendReward(ctx, company, reward);
+      const sentRow = await sendReward(ctx, company, reward, { season });
       if (sentRow.state === 'failed') return { paid: 0, reason: sentRow.last_error ?? 'failed', failed: true, reward: sentRow, capped: why }; // a permanent provider error: nothing was paid
       return { paid: amount, reward: sentRow, capped: why };
     }
@@ -172,7 +176,7 @@ export const isTransient = (code) => TRANSIENT.has(code) || /^(5\d\d|http_5\d\d)
 // NOTE: 'cap_reached' (a Moneypenny rule cap) is deliberately PERMANENT for the row (it fails visibly, open_failed_rewards, and an admin can revive it after raising the cap).
 /** Send one queued reward to the provider. Safe to repeat: the provider replays the first answer for the same key. */
 export const SEND_COST = 9; // queries and provider calls one send needs (the attempt mark, the account, the call, the receipt)
-export async function sendReward(ctx, company, r) {
+export async function sendReward(ctx, company, r, hint = {}) {
   if (r.state !== 'queued') return r;
   if (ctx.budget && !ctx.budget.unlimited && ctx.budget.left() < SEND_COST) throw new BudgetReached(); // checked BEFORE the attempt is counted: a budget cut is never an attempt
   if (r.sent_amount === 0) { // fully taken by a pending correction: nothing to send
@@ -191,7 +195,7 @@ export async function sendReward(ctx, company, r) {
     return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
   }
   if (r.sent_amount > MAX_SINGLE_CREDIT && company.provider === 'moneypenny') { await failReward(ctx, company, r, 'above_provider_max'); return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id); } // v1 never splits a credit and never sends one the provider would cut
-  const season = r.season_id ? await ctx.db.first('SELECT * FROM season WHERE id = ?', r.season_id) : null;
+  const season = r.season_id ? (hint.season?.id === r.season_id ? hint.season : await ctx.db.first('SELECT * FROM season WHERE id = ?', r.season_id)) : null;
   // Mark the attempt BEFORE the call. If we crash between the provider crediting and our receipt, attempts > 0 tells
   // everybody this credit may already exist at the provider, so the row is never voided, only sent and then reversed.
   // If this changes no row, somebody (a void, or another sender) got there first: the provider is NOT called.
