@@ -114,6 +114,7 @@ export async function grant(ctx, company, p) {
     if (budgetGuard) guards.push(budgetGuard);
     guards.push(...takeGuard(takes));
     if (p.alsoGuard) guards.push(p.alsoGuard);
+    if (p.paidGuard) guards.push({ sql: `(SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id = ? AND person_id = ? AND group_key = ? AND state IN ${COUNT}) = ?`, params: [company.id, p.person.id, p.groupKey, p.paidGuard.paid] }); // a period grant is made only while the group's counted total is still the one it was computed from
     if (p.alsoGuardBoth) guards.push(p.alsoGuardBoth); // a condition that must hold for the close AND the insert (person not erased, event still open)
     const id = newId('rw'), sent = amount - offset;
     const noteJson = JSON.stringify({ offset, takes, note: p.note ?? null, at: p.at, bypass: !!p.bypassCaps, periodBonus: !!p.periodBonus });
@@ -139,6 +140,7 @@ export async function grant(ctx, company, p) {
     if (res[(p.also ?? []).length].changes === 0) { // a guard failed: somebody else got there first. Read the numbers again.
       const r = await ctx.db.first('SELECT * FROM reward WHERE idem_key = ?', p.idem);
       if (r) return replayOf(r);
+      if (p.paidGuard) return { paid: 0, reason: 'stale' }; // the group moved under us: the caller reads it again and recomputes (never pays from an old figure)
       continue;
     }
     const reward = await ctx.db.first('SELECT * FROM reward WHERE id = ?', id);
@@ -607,7 +609,7 @@ export async function ledgerLine(ctx, company, accountRef, rewardId) {
   let line = null, reachable = true;
   try {
     let before = null;
-    for (let pg = 0; pg < 5 && !line; pg++) {
+    for (let pg = 0; pg < 20 && !line; pg++) { // at most 20 pages of 100 lines
       const h = await ctx.provider(company).history({ accountRef, limit: 100, beforeSeq: before });
       line = (h.lines ?? []).find((l) => l.ref === rewardId || l.ref === 'manual:' + rewardId) ?? null;
       before = h.next_before_seq ?? null; if (before == null) break;
@@ -636,16 +638,19 @@ const keyAfter = (key) => { const m = /^(.*):re(\d+)$/.exec(String(key)); return
  * ONE batch closes the old row and inserts the new one, the close carrying the same budget guards as the insert and the insert guarded on the old row being closed by this action;
  * the audit line is the batch's own reward.create (the admin is its actor, reissue_of names the old row). If the new row cannot be placed, the old row is untouched (409 reissue_not_payable).
  */
-export async function reissueReward(ctx, company, actor, { id, confirm, amount = null, note = null } = {}) {
+export async function reissueReward(ctx, company, actor, opts = {}) {
+  const { id, confirm, note = null } = opts;
+  const hasAmount = Object.hasOwn(opts, 'amount') && opts.amount !== undefined; // absent (or undefined) = the default, the whole rest; present (even null) must be a whole number
+  const amount = hasAmount ? opts.amount : null;
   if (confirm !== true) throw new ApiError(400, 'confirm_required', 'Check the Moneypenny ledger first, then confirm that the old credit is not there (or only in part).');
   const text = noteOf(note);
-  if (amount != null && (typeof amount !== 'number' || !Number.isSafeInteger(amount))) throw new ApiError(400, 'bad_amount', 'The amount must be a whole number of credits.'); // BEFORE any replay: a repeat with a bad amount is never answered 200
+  if (hasAmount && (typeof amount !== 'number' || !Number.isSafeInteger(amount))) throw new ApiError(400, 'bad_amount', 'The amount must be a whole number of credits.'); // BEFORE any replay: a repeat with a bad amount is never answered 200
   const r = await ctx.db.first('SELECT * FROM reward WHERE id = ? AND company_id = ?', id, company.id);
   if (r && r.event_id == null && ['tier', 'streak', 'team'].includes(r.kind)) throw new ApiError(409, 'not_supported_in_v1', 'A period bonus (tier, streak or team) cannot be re-issued in v1: check the Moneypenny ledger and fix it by hand outside the app.');
   if (r && r.event_id && ['reissued', 'closed_partial'].includes(r.last_error)) { // asked again after it worked: the same answer
     const done = await ctx.db.first('SELECT * FROM reward WHERE company_id = ? AND idem_key = ?', company.id, keyAfter(r.idem_key));
     if (done) {
-      if (amount != null && amount !== done.amount) throw new ApiError(409, 'changed', 'This reward was already re-issued with another amount.');
+      if (hasAmount && amount !== done.amount) throw new ApiError(409, 'changed', 'This reward was already re-issued with another amount.');
       return { closed: r.id, new_reward: done.id, key: done.idem_key, state: done.state, paid: done.state === 'sent' ? done.sent_amount : 0, replay: true };
     }
   }

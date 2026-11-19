@@ -409,7 +409,7 @@ route('POST', '/api/admin/settle', async (c) => { adm(c); return settleCompany(c
 route('POST', '/api/admin/retry-ops', async (c) => { adm(c); return retryOps(c.ctx, c.company); });
 route('POST', '/api/admin/retry-partials', async (c) => { adm(c); return R.retryPartialsNow(c.ctx, c.company); });
 route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
-route('POST', '/api/admin/reissue', async (c) => { adm(c); return R.reissueReward(c.ctx, c.company, c.user?.id ?? 'admin', { id: c.body?.id, confirm: c.body?.confirm, amount: c.body?.amount, note: c.body?.note }); });
+route('POST', '/api/admin/reissue', async (c) => { adm(c); return R.reissueReward(c.ctx, c.company, c.user?.id ?? 'admin', { id: c.body?.id, confirm: c.body?.confirm, note: c.body?.note, ...(c.body && Object.hasOwn(c.body, 'amount') ? { amount: c.body.amount } : {}) }); });
 route('GET', '/api/admin/needs-admin', async (c) => { adm(c); return R.needsAdmin(c.ctx, c.company, { limit: c.url?.searchParams?.get('limit') ?? c.query?.limit, offset: c.url?.searchParams?.get('offset') ?? c.query?.offset }); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin', { force: c.body?.force === true }); });
 route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });

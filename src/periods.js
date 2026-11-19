@@ -49,8 +49,22 @@ async function quickRetryDue(ctx, company, person, groupKey) {
   return f.n < 3 || ctx.now() - (f.m ?? 0) >= 7 * DAY;
 }
 
-/** Bring what was paid for (person, group) in line with what is earned now. */
-export async function settleEntitlement(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label }) {
+/**
+ * Bring what was paid for (person, group) in line with what is earned now.
+ * Runs may overlap (lazy tick, cron tick, ingest tick, admin settle, season close: nothing locks). Every write that moves money is a guarded INSERT that holds only while the group's counted total is still
+ * the figure it was computed from, so a stale run inserts nothing and answers 'stale'; this wrapper then reads the group again and recomputes (bounded). The database enforces
+ * "counted gross paid - recovered corrections <= entitlement" for any interleaving; key luck is not relied on.
+ */
+export async function settleEntitlement(ctx, company, args) {
+  let out;
+  for (let i = 0; i < 6; i++) {
+    out = await settleOnce(ctx, company, args);
+    if (!out.stale) return out;
+    await new Promise((r) => setTimeout(r, 1 + Math.floor(Math.random() * 4 * (i + 1))));
+  }
+  return { ...out, stale: false, skipped: (out.skipped ?? 0) + 1, skipCode: 'busy' }; // still moving: the next run settles it (nothing was paid from an old figure)
+}
+async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label }) {
   const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
   let paid = await paidSum(ctx, company.id, person.id, groupKey);
   const out = { paid: 0, reversed: healed };
@@ -120,7 +134,12 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
       if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, owed); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app (v1 never tops a group up by itself)
     } else if (missing === 0) await markGroupOwed(ctx, company.id, person.id, groupKey, 0); // never unlist a group that still has an undelivered remainder
   }
-  if (entitled > paid && !canReverse) paid += await netCorrections(ctx, company, person, groupKey, periodKey, entitled, paid);
+  if (entitled > paid && !canReverse) {
+    const nt = await netCorrections(ctx, company, person, groupKey, periodKey, entitled);
+    if (nt.busy) { out.skipped = (out.skipped ?? 0) + 1; out.skipCode = 'busy'; return out; } // never fall through to a cash payment on a failed net: this group waits for the next run
+    if (nt.stale) { out.stale = true; return out; }
+    paid = nt.paid;
+  }
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.
     // Two settle runs at the same time therefore make the same key, and the second one is a replay.
@@ -130,7 +149,8 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
     const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n * (futureOn(ctx.env, company) ? 1 : 0); // v1: a failed period row is never re-sent by itself (needs an admin) // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
     const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && await quickRetryDue(ctx, company, person, groupKey) ? `:x${stale}` : '');
-    const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system' });
+    const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system', paidGuard: { paid } });
+    if (g.reason === 'stale') { out.stale = true; return out; }
     out.paid = g.paid;
     if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';
   }
@@ -142,8 +162,9 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
  * so a rise is first netted against those open corrections of this group: the correction shrinks (cleared when nothing is left open) and a recorded +n row restores what is counted as paid. Only the rest is paid in cash.
  * Invariant: gross paid to the provider for the group - recovered corrections <= entitlement. Returns the amount netted.
  */
-async function netCorrections(ctx, company, person, groupKey, periodKey, entitled, paid) {
-  let left = entitled - paid, netted = 0;
+async function netCorrections(ctx, company, person, groupKey, periodKey, entitled) {
+  const cur = await paidSum(ctx, company.id, person.id, groupKey); // read now, against the CURRENT rows: the rise is entitled - cur, never more
+  let left = entitled - cur, netted = 0;
   const dns = await ctx.db.all("SELECT id, note FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%' ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
   for (const dn of dns) {
     if (left <= 0) break;
@@ -155,14 +176,18 @@ async function netCorrections(ctx, company, person, groupKey, periodKey, entitle
     const at = ctx.now(), rid = newId('rw'), idem = `nt:${person.id}:${groupKey}:${cid}:a${c.amount}:r${c.recovered}:n${n}`;
     try {
       const res = await commit(ctx, company.id, 'system', 'reward.net', { person: person.id, group: groupKey, correction: cid, netted: n, entitled }, [
-        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) SELECT ?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0 WHERE EXISTS (SELECT 1 FROM correction WHERE id=? AND state='open' AND amount - recovered >= ? AND amount = ? AND recovered = ?)",
-          rid, company.id, person.id, groupKey, idem, n, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason: 'rise_netted', net: true, correction: cid }), at, cid, n, c.amount, c.recovered],
+        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) SELECT ?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0 WHERE EXISTS (SELECT 1 FROM correction WHERE id=? AND state='open' AND amount - recovered >= ? AND amount = ? AND recovered = ?) AND (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN " + COUNT + ") = ?",
+          rid, company.id, person.id, groupKey, idem, n, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason: 'rise_netted', net: true, correction: cid }), at, cid, n, c.amount, c.recovered, company.id, person.id, groupKey, cur + netted],
         ["UPDATE correction SET amount = amount - ?, state = CASE WHEN recovered >= amount - ? THEN 'cleared' ELSE state END WHERE id = ? AND state='open' AND amount = ? AND recovered = ? AND EXISTS (SELECT 1 FROM reward WHERE id = ?)", n, n, cid, c.amount, c.recovered, rid],
       ], { onlyIf: { sql: 'SELECT 1 FROM reward WHERE id = ?', params: [rid] } });
-      if (res[0].changes > 0) { netted += n; left -= n; }
-    } catch (e) { if (!/idem_key|busy/i.test(String(e?.message))) throw e; } // another settle run did the same; the next run sees the new figures
+      if (res[0].changes > 0) { netted += n; left -= n; } else return { stale: true, paid: cur + netted };
+    } catch (e) {
+      if (/idem_key/i.test(String(e?.message))) return { stale: true, paid: cur + netted }; // another run did the same net
+      if (/audit chain is busy/i.test(String(e?.message))) return { busy: true, paid: cur + netted };
+      throw e;
+    }
   }
-  return netted;
+  return { paid: cur + netted };
 }
 
 /** One 'period.settle_error' line per (group, code) until the code changes: a stuck entry must not grow the audit chain at every tick. */
