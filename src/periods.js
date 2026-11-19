@@ -3,7 +3,7 @@
 // A positive difference is paid once (idempotent). A negative one is reversed. So a later cancellation is corrected at the next close.
 import { settingsOf } from './config.js';
 import { futureOn } from './v1.js';
-import { grant, reverseReward, seasonAt, healPendingReverses, groupBlocker, markGroupOwed } from './rewards.js';
+import { grant, reverseReward, seasonAt, healPendingReverses, groupBlocker, markGroupOwed, groupUndelivered } from './rewards.js';
 import { periodOf, prevPeriod, DAY, sha256Hex, newId, monthKey, dayKey } from './util.js';
 import { commit } from './audit.js';
 import { ProviderError } from './provider/errors.js';
@@ -112,10 +112,13 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   if (!futureOn(ctx.env, company)) {
     // v1: a group with a failed row, a partly granted row, or a row the system voided and nothing replaced is NEVER paid again by the settle (it may have landed): it shows in the needs-admin list (the SAME predicate: GROUP_BLOCKER),
     // whether or not other rows cover the amount, for as long as something is still owed. Once nothing is owed (entitled <= paid) the figure is 0 and the group leaves the list.
-    if (entitled > paid) {
+    // "paid" here is what was DELIVERED: a partly granted row counts what the provider granted (and what an admin-visible cut removed), not its full amount. owed = entitled - delivered.
+    const missing = await groupUndelivered(ctx, company.id, person.id, groupKey);
+    const owed = entitled - (paid - missing);
+    if (owed > 0) {
       const blk = await groupBlocker(ctx, company.id, person.id, groupKey);
-      if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, entitled - paid); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app
-    } else await markGroupOwed(ctx, company.id, person.id, groupKey, 0);
+      if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, owed); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app (v1 never tops a group up by itself)
+    } else if (missing === 0) await markGroupOwed(ctx, company.id, person.id, groupKey, 0); // never unlist a group that still has an undelivered remainder
   }
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.

@@ -20,7 +20,7 @@ Do the steps in order and tick them off. Write each id you receive into the roll
 1. `npx wrangler d1 create <database-name>` (use the name in `wrangler.toml`). Copy the printed database id into `wrangler.toml` `database_id`.
 2. Apply the migrations IN ORDER, lowest number first, each exactly once:
    `npx wrangler d1 migrations apply <database-name> --remote`
-   (the files are in `migrations/`, `0001_...` then `0002_...` and so on; apply only that folder to D1).
+   (the files are in `migrations/`, `0001_...` then `0002_...` and so on up to `0008_idx.sql` (an index only, safe to re-run); apply only that folder to D1).
 3. Check: `npx wrangler d1 execute <database-name> --remote --command "SELECT name FROM sqlite_master WHERE type='table'"` lists the tables and none is a balance table.
 4. Record the time of the first good backup point (see ROLLBACK.md, time travel).
 

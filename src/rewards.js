@@ -532,7 +532,7 @@ async function voidWaiting(ctx, company, r, n, reason) {
   const live = "EXISTS (SELECT 1 FROM reward WHERE id=? AND state='waiting')";
   const stmts = [];
   for (const [cid, t] of n.takes ?? []) stmts.push([`UPDATE correction SET recovered = MAX(0, recovered - ?), state = CASE WHEN state = 'cleared' THEN 'open' ELSE state END WHERE id = ? AND ${live}`, t, cid, r.id]);
-  stmts.push(["UPDATE reward SET state='void', reversed=1, last_error=? WHERE id=? AND state='waiting'", reason, r.id]); // last statement: onlyIfChanged is exact
+  stmts.push(["UPDATE reward SET state='void', reversed=1, last_error=?, note = json_set(COALESCE(note, '{}'), '$.voided_at', ?) WHERE id=? AND state='waiting'", reason, ctx.now(), r.id]); // last statement: onlyIfChanged is exact
   const res = await commit(ctx, company.id, 'system', 'reward.void', { orig: r.id, reason }, stmts, { onlyIfChanged: true });
   return res[res.length - 2].changes > 0;
 }
@@ -653,7 +653,8 @@ export async function reissueReward(ctx, company, actor, { id, confirm, amount =
   const n = JSON.parse(r.note || '{}');
   const delivered = partial ? r.sent_amount : 0;
   const rest = Math.max(0, r.amount - (partial ? (n.offset ?? 0) : 0) - delivered);
-  const want = amount == null ? rest : Number(amount);
+  if (amount != null && (typeof amount !== 'number' || !Number.isSafeInteger(amount))) throw new ApiError(400, 'bad_amount', 'The amount must be a whole number of credits.');
+  const want = amount == null ? rest : amount;
   if (!Number.isInteger(want) || want <= 0 || want > rest) throw new ApiError(400, 'bad_amount', 'The new grant must be more than 0 and at most what is still missing (' + rest + ').');
   assertCreditAmount(company, want, 'The new grant');
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
@@ -698,21 +699,40 @@ export async function markGroupOwed(ctx, companyId, personId, groupKey, owed) {
   else await ctx.db.run("UPDATE reward SET note = json_set(COALESCE(note, '{}'), '$.owed', 0) WHERE company_id = ? AND person_id = ? AND group_key = ? AND kind != 'reversal' AND state IN ('failed','sent','void') AND COALESCE(json_extract(note, '$.owed'), -1) != 0 AND (state = 'failed' OR last_error IN ('partial_grant','no_season','season_closed','season_cap'))", companyId, personId, groupKey);
 }
 
+/** What a partly granted row has NOT delivered (and nobody cut): the one definition of "delivered" for the settle, the blocker and the lists. alias a = the row. */
+export const undeliveredSql = (a) => `(CASE WHEN ${a}.state = 'sent' AND ${a}.last_error = 'partial_grant' THEN MAX(0, ${a}.amount - COALESCE(json_extract(${a}.note, '$.offset'), 0) - COALESCE(json_extract(${a}.note, '$.remCut'), 0) - ${a}.sent_amount) ELSE 0 END)`;
+/** What is undelivered across the group's partly granted rows (the settle's paid minus this is what was delivered). */
+export const groupUndelivered = async (ctx, companyId, personId, groupKey) => (await ctx.db.first(`SELECT COALESCE(SUM(${undeliveredSql('x')}), 0) u FROM reward x WHERE x.company_id = ? AND x.person_id = ? AND x.group_key = ? AND x.kind != 'reversal' AND x.reversed = 0`, companyId, personId, groupKey)).u;
+
 const NEEDS_LIVE = 'r.person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)';
+// A failed or partial event reward whose event is being reversed or was reversed is not listed: the reversal owns it (nothing to re-issue, re-issue answers 409 event_closed).
+const EV_OPEN = "NOT EXISTS (SELECT 1 FROM event e WHERE e.id = r.event_id AND e.status IN ('reversal_pending','reversed'))";
+const VOIDED_AT = "COALESCE(json_extract(r.note, '$.voided_at'), r.created_at)";
+const COLS = `r.id, r.person_id, r.kind, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at, ${undeliveredSql('r')} AS missing`;
+const eventsFrom = () => ({ where: `r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.reversed = 0 AND r.kind NOT IN ('reversal','penalty_return') AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant')) AND ${NEEDS_LIVE} AND ${EV_OPEN}`, params: [] });
+const voidedFrom = (now) => ({ where: `r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap') AND ${VOIDED_AT} > ? AND ${NEEDS_LIVE}
+    AND NOT EXISTS (SELECT 1 FROM reward y WHERE y.company_id = r.company_id AND y.event_id = r.event_id AND y.person_id = r.person_id AND y.kind = r.kind AND y.id != r.id AND y.state IN ${COUNT})`, params: [now - 30 * DAY] });
+const groupsFrom = () => ({ where: `r.company_id = ? AND r.event_id IS NULL AND r.kind IN ('tier','streak','team') AND ${blockerSql('r')} AND ${NEEDS_LIVE} AND (json_extract(r.note, '$.owed') > 0 OR json_extract(r.note, '$.owed') IS NULL)`, params: [] });
+/** COUNTS only (the overview): the same predicates as the lists, no rows. */
+export async function needsAdminCounts(ctx, company) {
+  const e = eventsFrom(), v = voidedFrom(ctx.now()), g = groupsFrom();
+  const events = (await ctx.db.first(`SELECT COUNT(*) n FROM reward r WHERE ${e.where}`, company.id)).n;
+  const events_voided = (await ctx.db.first(`SELECT COUNT(*) n FROM reward r WHERE ${v.where}`, company.id, ...v.params)).n;
+  const groups = (await ctx.db.first(`SELECT COUNT(*) n FROM (SELECT 1 FROM reward r WHERE ${g.where} GROUP BY r.person_id, r.group_key)`, company.id)).n;
+  return { events, events_voided, groups, total: events + events_voided + groups };
+}
 /**
- * What needs an admin in v1, derived from the rows (no extra table), with the REAL totals (no limit):
- *  events: failed or partly granted EVENT rewards (can be re-issued);
- *  events_voided: EVENT rewards the system voided (no season, season closed, cap met) in the last 30 days, no live reward replaces them (read only);
- *  groups: period groups (tier, streak, team) the settle cannot pay because a row of the group blocks it (GROUP_BLOCKER) and something is still owed (read only: fixed by hand outside the app).
+ * What needs an admin in v1, derived from the rows (no extra table). Each list is paged (limit, default 200, and offset) and every answer carries the real totals:
+ *  events: failed or partly granted EVENT rewards (can be re-issued); not listed once their event is being reversed or was reversed (the reversal owns them);
+ *  events_voided: EVENT rewards the system voided (no season, season closed, cap met) in the last 30 days counted from the VOID, no live reward replaces them (read only);
+ *  groups: period groups (tier, streak, team) the settle cannot pay because a row of the group blocks it (GROUP_BLOCKER) and something is still owed, delivered counted (a partly granted row counts what it delivered) (read only: fixed by hand outside the app; there is no dismiss).
  */
-export async function needsAdmin(ctx, company) {
-  const cols = 'r.id, r.person_id, r.kind, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at';
-  const events = await ctx.db.all(`SELECT ${cols} FROM reward r WHERE r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.reversed = 0 AND r.kind NOT IN ('reversal','penalty_return') AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant')) AND ${NEEDS_LIVE} ORDER BY r.created_at DESC`, company.id);
-  const events_voided = await ctx.db.all(`SELECT ${cols} FROM reward r WHERE r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap') AND r.created_at > ? AND ${NEEDS_LIVE}
-    AND NOT EXISTS (SELECT 1 FROM reward y WHERE y.company_id = r.company_id AND y.event_id = r.event_id AND y.person_id = r.person_id AND y.kind = r.kind AND y.id != r.id AND y.state IN ${COUNT}) ORDER BY r.created_at DESC`, company.id, ctx.now() - 30 * DAY);
-  const rows = await ctx.db.all(`SELECT ${cols}, r.group_key, json_extract(r.note, '$.owed') AS owed FROM reward r WHERE r.company_id = ? AND r.event_id IS NULL AND r.kind IN ('tier','streak','team') AND ${blockerSql('r')} AND ${NEEDS_LIVE}
-    AND (json_extract(r.note, '$.owed') > 0 OR json_extract(r.note, '$.owed') IS NULL) ORDER BY r.created_at DESC`, company.id);
-  const seen = new Set(), groups = [];
-  for (const g of rows) { const k = g.person_id + '|' + g.group_key; if (seen.has(k)) continue; seen.add(k); groups.push(g); }
-  return { events, events_voided, groups, total: events.length + events_voided.length + groups.length };
+export async function needsAdmin(ctx, company, { limit = 200, offset = 0 } = {}) {
+  limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 200)); offset = Math.max(0, Number(offset) | 0);
+  const e = eventsFrom(), v = voidedFrom(ctx.now()), g = groupsFrom();
+  const events = await ctx.db.all(`SELECT ${COLS} FROM reward r WHERE ${e.where} ORDER BY r.created_at DESC, r.id LIMIT ? OFFSET ?`, company.id, limit, offset);
+  const events_voided = await ctx.db.all(`SELECT ${COLS} FROM reward r WHERE ${v.where} ORDER BY r.created_at DESC, r.id LIMIT ? OFFSET ?`, company.id, ...v.params, limit, offset);
+  const groups = await ctx.db.all(`SELECT ${COLS}, r.group_key, json_extract(r.note, '$.owed') AS owed, MAX(r.created_at) AS latest FROM reward r WHERE ${g.where} GROUP BY r.person_id, r.group_key ORDER BY latest DESC, r.id LIMIT ? OFFSET ?`, company.id, limit, offset);
+  const totals = await needsAdminCounts(ctx, company);
+  return { events, events_voided, groups, total: totals.total, totals, limit, offset };
 }
