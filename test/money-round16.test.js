@@ -77,10 +77,10 @@ test('Y4 X2: a drop in v1 is a DELTA: 3000 -> 2600 owes 400, pays nothing again,
   await entitle(w, 2600);
   assert.equal(await corr(w), 400); assert.equal(await net(w), 2600); assert.equal(await bal(), after, 'nothing re-granted');
   await entitle(w, 2600); assert.equal(await corr(w), 400, 'idempotent: no second correction');
-  await entitle(w, 3000); // regained tier: the 400 is topped up although the cap is 3000 (net 2600 counts)
-  assert.equal(await net(w), 3000);
-  await entitle(w, 2600); // and dropped again: a second, separate correction
-  assert.equal(await corr(w), 800); assert.equal(await net(w), 2600);
+  await entitle(w, 3000); // regained tier (round 24): the person still holds the 400, so the correction is netted and nothing is paid in cash
+  assert.equal(await net(w), 3000); assert.equal(await bal(), after, 'no cash top-up'); assert.equal(await corr(w), 0, 'the correction was netted away');
+  await entitle(w, 2600); // and dropped again: a new correction
+  assert.equal(await corr(w), 400); assert.equal(await net(w), 2600);
   assert.equal((await w.db.first("SELECT COUNT(*) n FROM reward WHERE kind='tier' AND reversed=1")).n, 0, 'the original rows are never reversed in v1');
 });
 

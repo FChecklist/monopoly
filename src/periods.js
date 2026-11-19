@@ -93,12 +93,12 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     const owedNow = left;
     const n = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%'", company.id, person.id, groupKey)).n;
     const reason = 'tier_lost:' + (label ?? kind);
-    const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`;
+    const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`, cid = newId('cr'); // the correction id rides in the delta row's note: a later rise nets against exactly this correction
     try {
       await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: owedNow, entitled, delta: true }, [
         ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0)",
-          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason, delta: true, owed: owedNow, cut: d - owedNow }), ctx.now()],
-        ...(owedNow > 0 ? [["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", newId('cr'), company.id, person.id, owedNow, reason, ctx.now()]] : []),
+          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason, delta: true, owed: owedNow, cut: d - owedNow, cid: owedNow > 0 ? cid : null }), ctx.now()],
+        ...(owedNow > 0 ? [["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", cid, company.id, person.id, owedNow, reason, ctx.now()]] : []),
       ]);
       out.owed = owedNow;
     } catch (e) { if (!/idem_key/i.test(String(e?.message))) throw e; } // another settle run did the same delta
@@ -120,6 +120,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
       if (blk) { await markGroupOwed(ctx, company.id, person.id, groupKey, owed); out.blocked = 'needs_admin'; out.failedCode = blk.last_error ?? 'failed'; return out; } // fixed by hand outside the app (v1 never tops a group up by itself)
     } else if (missing === 0) await markGroupOwed(ctx, company.id, person.id, groupKey, 0); // never unlist a group that still has an undelivered remainder
   }
+  if (entitled > paid && !canReverse) paid += await netCorrections(ctx, company, person, groupKey, periodKey, entitled, paid);
   if (entitled > paid) {
     // The key depends on what is owed and on how many rows of this group were reversed or voided by a reversal (a void writes no reversal row). A row the system itself voided as unreleasable (no_season, season_closed, season_cap: exactly these last_error values, set only by voidWaiting; a void by reversal clears last_error) is not counted, or it would be re-created at every tick, never on how many rows exist.
     // Two settle runs at the same time therefore make the same key, and the second one is a replay.
@@ -134,6 +135,34 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';
   }
   return out;
+}
+
+/**
+ * The entitlement rose again after a drop (v1: the drop was booked as a delta row plus an open correction, nothing was taken back at the provider). The person still HOLDS what the correction says is owed back,
+ * so a rise is first netted against those open corrections of this group: the correction shrinks (cleared when nothing is left open) and a recorded +n row restores what is counted as paid. Only the rest is paid in cash.
+ * Invariant: gross paid to the provider for the group - recovered corrections <= entitlement. Returns the amount netted.
+ */
+async function netCorrections(ctx, company, person, groupKey, periodKey, entitled, paid) {
+  let left = entitled - paid, netted = 0;
+  const dns = await ctx.db.all("SELECT id, note FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%' ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
+  for (const dn of dns) {
+    if (left <= 0) break;
+    let cid = null; try { cid = JSON.parse(dn.note || '{}').cid ?? null; } catch { /* no link */ }
+    if (!cid) continue;
+    const c = await ctx.db.first("SELECT amount, recovered FROM correction WHERE id=? AND company_id=? AND person_id=? AND state='open'", cid, company.id, person.id);
+    const n = Math.min(left, c ? c.amount - c.recovered : 0);
+    if (n <= 0) continue;
+    const at = ctx.now(), rid = newId('rw'), idem = `nt:${person.id}:${groupKey}:${cid}:a${c.amount}:r${c.recovered}:n${n}`;
+    try {
+      const res = await commit(ctx, company.id, 'system', 'reward.net', { person: person.id, group: groupKey, correction: cid, netted: n, entitled }, [
+        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) SELECT ?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0 WHERE EXISTS (SELECT 1 FROM correction WHERE id=? AND state='open' AND amount - recovered >= ? AND amount = ? AND recovered = ?)",
+          rid, company.id, person.id, groupKey, idem, n, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason: 'rise_netted', net: true, correction: cid }), at, cid, n, c.amount, c.recovered],
+        ["UPDATE correction SET amount = amount - ?, state = CASE WHEN recovered >= amount - ? THEN 'cleared' ELSE state END WHERE id = ? AND state='open' AND amount = ? AND recovered = ? AND EXISTS (SELECT 1 FROM reward WHERE id = ?)", n, n, cid, c.amount, c.recovered, rid],
+      ], { onlyIf: { sql: 'SELECT 1 FROM reward WHERE id = ?', params: [rid] } });
+      if (res[0].changes > 0) { netted += n; left -= n; }
+    } catch (e) { if (!/idem_key|busy/i.test(String(e?.message))) throw e; } // another settle run did the same; the next run sees the new figures
+  }
+  return netted;
 }
 
 /** One 'period.settle_error' line per (group, code) until the code changes: a stuck entry must not grow the audit chain at every tick. */

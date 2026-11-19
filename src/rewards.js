@@ -639,12 +639,13 @@ const keyAfter = (key) => { const m = /^(.*):re(\d+)$/.exec(String(key)); return
 export async function reissueReward(ctx, company, actor, { id, confirm, amount = null, note = null } = {}) {
   if (confirm !== true) throw new ApiError(400, 'confirm_required', 'Check the Moneypenny ledger first, then confirm that the old credit is not there (or only in part).');
   const text = noteOf(note);
+  if (amount != null && (typeof amount !== 'number' || !Number.isSafeInteger(amount))) throw new ApiError(400, 'bad_amount', 'The amount must be a whole number of credits.'); // BEFORE any replay: a repeat with a bad amount is never answered 200
   const r = await ctx.db.first('SELECT * FROM reward WHERE id = ? AND company_id = ?', id, company.id);
   if (r && r.event_id == null && ['tier', 'streak', 'team'].includes(r.kind)) throw new ApiError(409, 'not_supported_in_v1', 'A period bonus (tier, streak or team) cannot be re-issued in v1: check the Moneypenny ledger and fix it by hand outside the app.');
   if (r && r.event_id && ['reissued', 'closed_partial'].includes(r.last_error)) { // asked again after it worked: the same answer
     const done = await ctx.db.first('SELECT * FROM reward WHERE company_id = ? AND idem_key = ?', company.id, keyAfter(r.idem_key));
     if (done) {
-      if (amount != null && Number(amount) !== done.amount) throw new ApiError(409, 'changed', 'This reward was already re-issued with another amount.');
+      if (amount != null && amount !== done.amount) throw new ApiError(409, 'changed', 'This reward was already re-issued with another amount.');
       return { closed: r.id, new_reward: done.id, key: done.idem_key, state: done.state, paid: done.state === 'sent' ? done.sent_amount : 0, replay: true };
     }
   }
@@ -710,7 +711,7 @@ const EV_OPEN = "NOT EXISTS (SELECT 1 FROM event e WHERE e.id = r.event_id AND e
 const VOIDED_AT = "COALESCE(json_extract(r.note, '$.voided_at'), r.created_at)";
 const COLS = `r.id, r.person_id, r.kind, r.amount, r.sent_amount, r.state, r.last_error AS reason, r.created_at, ${undeliveredSql('r')} AS missing`;
 const eventsFrom = () => ({ where: `r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.reversed = 0 AND r.kind NOT IN ('reversal','penalty_return') AND (r.state = 'failed' OR (r.state = 'sent' AND r.last_error = 'partial_grant')) AND ${NEEDS_LIVE} AND ${EV_OPEN}`, params: [] });
-const voidedFrom = (now) => ({ where: `r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap') AND ${VOIDED_AT} > ? AND ${NEEDS_LIVE}
+const voidedFrom = (now) => ({ where: `r.company_id = ? AND r.event_id IS NOT NULL AND r.amount > 0 AND r.state = 'void' AND r.last_error IN ('no_season','season_closed','season_cap') AND ${VOIDED_AT} > ? AND ${NEEDS_LIVE} AND ${EV_OPEN}
     AND NOT EXISTS (SELECT 1 FROM reward y WHERE y.company_id = r.company_id AND y.event_id = r.event_id AND y.person_id = r.person_id AND y.kind = r.kind AND y.id != r.id AND y.state IN ${COUNT})`, params: [now - 30 * DAY] });
 const groupsFrom = () => ({ where: `r.company_id = ? AND r.event_id IS NULL AND r.kind IN ('tier','streak','team') AND ${blockerSql('r')} AND ${NEEDS_LIVE} AND (json_extract(r.note, '$.owed') > 0 OR json_extract(r.note, '$.owed') IS NULL)`, params: [] });
 /** COUNTS only (the overview): the same predicates as the lists, no rows. */
@@ -728,7 +729,7 @@ export async function needsAdminCounts(ctx, company) {
  *  groups: period groups (tier, streak, team) the settle cannot pay because a row of the group blocks it (GROUP_BLOCKER) and something is still owed, delivered counted (a partly granted row counts what it delivered) (read only: fixed by hand outside the app; there is no dismiss).
  */
 export async function needsAdmin(ctx, company, { limit = 200, offset = 0 } = {}) {
-  limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 200)); offset = Math.max(0, Number(offset) | 0);
+  limit = Math.max(1, Math.min(1000, Math.trunc(Number(limit)) || 200)); offset = Math.max(0, Math.min(1e9, Math.trunc(Number(offset)) || 0));
   const e = eventsFrom(), v = voidedFrom(ctx.now()), g = groupsFrom();
   const events = await ctx.db.all(`SELECT ${COLS} FROM reward r WHERE ${e.where} ORDER BY r.created_at DESC, r.id LIMIT ? OFFSET ?`, company.id, limit, offset);
   const events_voided = await ctx.db.all(`SELECT ${COLS} FROM reward r WHERE ${v.where} ORDER BY r.created_at DESC, r.id LIMIT ? OFFSET ?`, company.id, ...v.params, limit, offset);

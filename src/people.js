@@ -192,6 +192,12 @@ export async function correctDetails(ctx, company, actor, personId, input) {
 }
 
 /** Scrub the sealed name, e-mail and work id (and the e-mail hash) of a person who has left. Ids and the ledger stay. */
+/** The audit chain can be busy when many writers commit at once (the batch is rolled back, nothing applied): try a few times with a small back-off before failing. */
+async function withBusyRetry(fn, tries = 6) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); } catch (e) { if (i >= tries - 1 || !/audit chain is busy/i.test(String(e?.message))) throw e; await new Promise((r) => setTimeout(r, 5 * (i + 1) + Math.floor(Math.random() * 10))); }
+  }
+}
 export async function eraseLeaver(ctx, company, actor, personId) {
   if (!['admin', 'hr'].includes(actor.role)) throw new ApiError(403, 'not_allowed', 'Only the company admin or HR can do this.');
   const p = await ctx.db.first('SELECT * FROM app_user WHERE id = ? AND company_id = ?', personId, company.id);
@@ -207,7 +213,7 @@ export async function eraseLeaver(ctx, company, actor, personId) {
   const hit = ['person_id = ?', ...needles.flatMap(() => ["lower(payload) LIKE ? ESCAPE '\\'", "lower(COALESCE(reason, '')) LIKE ? ESCAPE '\\'"])].join(' OR ');
   const aiScrub = ["UPDATE ai_request SET payload = '{\"erased\":true}', reason = '', result = NULL, status = CASE WHEN status = 'pending' THEN 'cancelled' ELSE status END, run_state = NULL WHERE company_id = ? AND (" + hit + ')', company.id, p.id, ...needles.flatMap((x) => [x, x])];
   const idemScrub = ["UPDATE api_idem SET body = NULL, subject = NULL WHERE subject IS NOT NULL AND instr(subject, ',' || ? || ',') > 0 AND key_id IN (SELECT key_id FROM company_key WHERE company_id = ?)", p.id, company.id];
-  await commit(ctx, company.id, actor.id, 'person.erase', { person: p.id }, [
+  await withBusyRetry(() => commit(ctx, company.id, actor.id, 'person.erase', { person: p.id }, [
     ["UPDATE app_user SET name_sealed = NULL, email_sealed = '', email_hash = ?, work_id_sealed = NULL, work_id_hash = NULL, provider_account_ref = NULL, erased_at = ? WHERE id = ? AND company_id = ?", 'erased:' + p.id, ctx.now(), p.id, company.id],
     ['DELETE FROM session WHERE user_id = ? AND company_id = ?', p.id, company.id],
     ['DELETE FROM login_code WHERE user_id = ?', p.id],
@@ -216,7 +222,7 @@ export async function eraseLeaver(ctx, company, actor, personId) {
     aiScrub, idemScrub,
     // the reward rows keep amounts, ids, states and the maybe_landed marker; the sealed account and any admin/ledger note are scrubbed
     ["UPDATE reward SET note = " + SCRUB_NOTE_SQL + " WHERE person_id = ? AND company_id = ?", p.id, company.id],
-  ]);
+  ]));
   return { ok: true, note: RETENTION_NOTE };
 }
 /** Leavers whose retention period has passed and who are not scrubbed yet. */

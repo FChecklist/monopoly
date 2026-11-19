@@ -860,12 +860,19 @@
     return out.concat(fn());
   }
   function needsAdminPanel() {
+    var more = { n: 0 };
     return panel('Rewards that need an admin', async function (reload) {
-      var d = await get('/api/admin/needs-admin'), who = {};
+      var d = await get('/api/admin/needs-admin?limit=200&offset=0'), who = {};
+      for (var pg = 1; pg <= more.n; pg++) { // 'Show more' pages already opened: fetch them again so a reload keeps them
+        var nx = await get('/api/admin/needs-admin?limit=200&offset=' + (pg * 200));
+        d.events = d.events.concat(nx.events); d.events_voided = d.events_voided.concat(nx.events_voided); d.groups = d.groups.concat(nx.groups);
+      }
       try { (await people()).forEach(function (p) { who[p.id] = p.name; }); } catch (e) { /* ids only */ }
       var voided = d.events_voided || [];
       if (!d.events.length && !d.groups.length && !voided.length) return empty('Nothing needs an admin.');
-      var out = [h('p', { 'class': 'muted', text: 'Check the Moneypenny ledger first. Nothing here is paid again by itself.' })];
+      var out = [h('p', { 'class': 'muted', text: 'Check the Moneypenny ledger first. Nothing here is paid again by itself.' }),
+        h('p', { 'class': 'muted small', text: 'Showing ' + (d.events.length + voided.length + d.groups.length) + ' of ' + d.total + ' (' + d.totals.events + ' event rewards, ' + d.totals.events_voided + ' not paid, ' + d.totals.groups + ' period bonuses).' })];
+      if (d.events.length < d.totals.events || voided.length < d.totals.events_voided || d.groups.length < d.totals.groups) out.push(button('Show more', function () { more.n += 1; reload(); }, 'small'));
       if (d.events.length) {
         out.push(h('ul', { 'class': 'list' }, d.events.map(function (x) {
           return h('li', null, h('b', { text: who[x.person_id] || 'person ' + tail(x.person_id) }), ' ', statusChip(x.state === 'failed' ? 'failed' : 'partly sent'),
