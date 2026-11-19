@@ -3,6 +3,7 @@ import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
 import { accountRef, retryQueued, releaseSeasonHold, releasePendingHolds } from './rewards.js';
+import { intend, intendStmt, run, settleOp, unsettled } from './provider-ops.js';
 import { ProviderError } from './provider/errors.js';
 
 const must = (actor, ...roles) => { if (!roles.includes(actor.role)) throw new ApiError(403, 'not_allowed', 'You cannot do this.'); };
@@ -91,18 +92,18 @@ export async function publishSeason(ctx, company, actor, seasonId, { allowStarte
   if (s.starts_at <= ctx.now() && !allowStarted) throw new ApiError(409, 'starts_in_past', 'Publish before the start date, so nothing changes under people.');
   const st = settingsOf(company);
   if (s.mode === 'dice' && st.bonus_floor_pct < 10) throw new ApiError(409, 'floor', 'Dice mode needs a bonus floor of at least 10 percent.');
-  let hold = null;
+  let hold = null, rop = null;
   const prov = ctx.provider(company);
   if ((await prov.capabilities()).hold) {
     const topUp = s.mode === 'dice' ? Math.ceil(s.budget * (1 + st.bonus_max_pct / 100)) : s.budget; // the whole range is funded in advance
-    const n = (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'season.hold_intent' AND instr(data, ?) > 0", company.id, `"id":"${s.id}"`)).n;
+    const n = (await ctx.db.first("SELECT COUNT(*) n FROM provider_op WHERE company_id = ? AND kind = 'hold_reserve' AND subject = ?", company.id, s.id)).n;
     const key = n ? `hold:${s.id}:n${n}` : 'hold:' + s.id;
-    await commit(ctx, company.id, actor.id, 'season.hold_intent', { id: s.id, key, amount: topUp }); // before the call: a lost answer is found and released by the tick
-    const h = await prov.reserveBudget({ amount: topUp, name: s.name, idem: key });
-    hold = h.hold_id;
-    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold, key });
+    rop = await intend(ctx, company, { kind: 'hold_reserve', key, subject: s.id, params: { amount: topUp, name: s.name } }); // before the call: a lost answer is found and released by the tick
+    const res = await run(ctx, company, rop, (p) => prov.reserveBudget({ amount: p.amount, name: p.name, idem: key }));
+    if (res.state !== 'landed') throw new ProviderError(res.code ?? 'provider_down', `The hold was not confirmed (${res.code ?? 'busy'}); nothing was published.`, { retriable: true });
+    hold = res.result.hold_id;
   }
-  await commit(ctx, company.id, actor.id, 'season.publish', { id: s.id, hold }, [["UPDATE season SET status='published', published_at=?, hold_id=? WHERE id=? AND status='draft'", ctx.now(), hold, s.id]]);
+  await commit(ctx, company.id, actor.id, 'season.publish', { id: s.id, hold }, [["UPDATE season SET status='published', published_at=?, hold_id=? WHERE id=? AND status='draft'", ctx.now(), hold, s.id]].concat(rop ? [['UPDATE provider_op SET settled = 1 WHERE id = ? AND EXISTS (SELECT 1 FROM season WHERE id = ? AND hold_id = ?)', rop.id, s.id, hold]] : []));
   return { id: s.id, hold_id: hold };
 }
 export async function raiseBudget(ctx, company, actor, seasonId, budget) {
@@ -111,7 +112,7 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
   if (!s) throw new ApiError(404, 'no_season', 'No published season.');
   budget = mustInt(budget, 'budget', { max: 1e9 });
   if (budget < s.budget) throw new ApiError(409, 'only_up', 'A published budget can only go up.');
-  let holdId = s.hold_id;
+  let holdId = s.hold_id, rop = null;
   const prov = ctx.provider(company);
   if (s.hold_id && (await prov.capabilities()).hold) {
     // The new budget is held in full (less what was already paid out); the old hold's remainder goes back.
@@ -120,22 +121,22 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
     const used = (await ctx.db.first("SELECT COALESCE(SUM(sent_amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state='sent'", company.id, s.id)).n;
     const top = s.mode === 'dice' ? Math.ceil(budget * (1 + st.bonus_max_pct / 100)) : budget;
     const amount = Math.max(0, top - used);
-    const key = await holdKey(ctx, company, s.id, `${budget}:u${used}`);
-    // The intent is written BEFORE the call: a lost answer leaves a line the tick can replay (same key) to find the hold and give it back.
-    await commit(ctx, company.id, actor.id, 'season.hold_intent', { id: s.id, key, amount });
-    const h = await prov.reserveBudget({ amount, name: s.name, idem: key });
-    holdId = h.hold_id;
-    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold: holdId, key });
+    // Every reserve attempt has its own key (a released hold is never replayed) and is announced before the call (a lost answer is found by the tick).
+    const n = (await ctx.db.first("SELECT COUNT(*) n FROM provider_op WHERE company_id = ? AND kind = 'hold_reserve' AND subject = ?", company.id, s.id)).n;
+    const key = `hold:${s.id}:${budget}:u${used}:n${n}`;
+    rop = await intend(ctx, company, { kind: 'hold_reserve', key, subject: s.id, params: { amount, name: s.name } });
+    const res = await run(ctx, company, rop, (p) => prov.reserveBudget({ amount: p.amount, name: p.name, idem: key }));
+    if (res.state !== 'landed') throw new ProviderError(res.code ?? 'provider_down', `The hold was not confirmed (${res.code ?? 'busy'}); the tick checks it and gives it back if it is not used.`, { retriable: true });
+    holdId = res.result.hold_id;
   }
-  // The new hold is recorded FIRST; only then the old one goes back. The row only moves UP (a concurrent raise can never be lowered by this one).
-  const res = await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId, old: holdId !== s.hold_id ? s.hold_id : null }, [["UPDATE season SET budget = ?, hold_id = ? WHERE id = ? AND status = 'published' AND budget <= ?", budget, holdId, s.id, budget]], { onlyIfChanged: true }); // 'old' = the hold that must go back; the tick keeps trying until it has
-  if (res[res.length - 1].changes === 0) throw new ApiError(409, 'budget_changed', 'The budget changed while you were saving. Nothing was changed; the unused hold goes back.');
+  // One atomic commit: the season moves UP only (a concurrent raise is never lowered), the new hold is recorded as the season's, and the OLD hold's release is written as an operation the tick keeps replaying.
+  const mine = { sql: 'EXISTS (SELECT 1 FROM season WHERE id = ? AND hold_id IS ? AND budget = ?)', params: [s.id, holdId, budget] };
+  const stmts = [["UPDATE season SET budget = ?, hold_id = ? WHERE id = ? AND status = 'published' AND budget <= ?", budget, holdId, s.id, budget]];
+  if (rop) stmts.push([`UPDATE provider_op SET settled = 1 WHERE id = ? AND ${mine.sql}`, rop.id, ...mine.params]);
+  if (s.hold_id && holdId !== s.hold_id) stmts.push(intendStmt(ctx, company, { kind: 'hold_release', key: 'hrel:' + s.hold_id, subject: s.id, params: { hold: s.hold_id } }, mine));
+  const res = await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId }, stmts, { onlyIf: { sql: 'SELECT 1 FROM season WHERE id = ? AND hold_id IS ? AND budget = ?', params: [s.id, holdId, budget] } });
+  if (res[0].changes === 0) throw new ApiError(409, 'budget_changed', 'The budget changed while you were saving. Nothing was changed; the unused hold goes back.');
   try { await releasePendingHolds(ctx, company); } catch { /* the tick does it */ }
-}
-/** A hold key is never reused: every reserve attempt of a season has its own number, so a released hold is never replayed. */
-async function holdKey(ctx, company, seasonId, what) {
-  const n = (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'season.hold_intent' AND instr(data, ?) > 0", company.id, `"id":"${seasonId}"`)).n;
-  return `hold:${seasonId}:${what}:n${n}`;
 }
 export async function closeSeason(ctx, company, actor, seasonId) {
   must(actor, 'admin');
@@ -231,26 +232,59 @@ export async function placeOrder(ctx, company, person, itemId) {
   const id = newId('or');
   const prov = ctx.provider(company);
   if (!(await prov.capabilities()).spend) throw new ApiError(409, 'unsupported', 'This credit provider does not support spending.');
-  let hold;
-  try { hold = await prov.reserveSpend({ accountRef: await accountRef(ctx, company, person), amount: item.credits, ref: id, idem: 'order:' + id, item: item.name }); }
-  catch (e) { if (e instanceof ProviderError) throw new ApiError(e.code === 'insufficient_credits' ? 402 : 502, e.code, e.message); throw e; }
+  const ref = await accountRef(ctx, company, person);
+  const rop = await intend(ctx, company, { kind: 'order_reserve', key: 'ores:' + id, subject: id, params: { credits: item.credits, item: item.name, person: person.id } }); // before the call: an orphan hold is found by the tick
+  const res = await run(ctx, company, rop, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: id, idem: 'order:' + id, item: p.item }));
+  if (res.state === 'refused') throw new ApiError(res.code === 'insufficient_credits' ? 402 : 502, res.code, res.message ?? res.result?.message ?? 'The credit provider refused this order.');
+  if (res.state !== 'landed') throw new ApiError(502, res.code ?? 'provider_down', 'The credit provider did not confirm the order; nothing was ordered.');
+  const hold = { hold_id: res.result.hold_id };
   const approve = item.needs_approval === 0;
-  await commit(ctx, company.id, person.id, 'order.place', { id, item: item.id, credits: item.credits }, [['INSERT INTO catalogue_order (id, company_id, person_id, item_id, credits, state, hold_id, created_at) VALUES (?,?,?,?,?,?,?,?)', id, company.id, person.id, item.id, item.credits, 'reserved', hold.hold_id, ctx.now()]]);
+  await commit(ctx, company.id, person.id, 'order.place', { id, item: item.id, credits: item.credits }, [['INSERT INTO catalogue_order (id, company_id, person_id, item_id, credits, state, hold_id, created_at) VALUES (?,?,?,?,?,?,?,?)', id, company.id, person.id, item.id, item.credits, 'reserved', hold.hold_id, ctx.now()], ['UPDATE provider_op SET settled = 1 WHERE id = ?', rop.id]]);
   if (approve) return decideOrder(ctx, company, { id: 'system', role: 'admin' }, id, true);
   return { id, state: 'reserved' };
+}
+/** Call the provider for an order decision and record it (once). */
+async function driveOrder(ctx, company, op, actorId = 'system') {
+  const prov = ctx.provider(company);
+  const out = await run(ctx, company, op, (p) => (p.accept ? prov.captureSpend({ holdId: p.hold, idem: 'cap:' + op.subject }) : prov.releaseSpend({ holdId: p.hold, idem: 'rel:' + op.subject })));
+  if (out.state === 'landed') {
+    const state = op.params.accept ? 'captured' : 'released';
+    await commit(ctx, company.id, actorId, 'order.' + state, { id: op.subject }, [['UPDATE provider_op SET settled = 1 WHERE id = ?', op.id], ["UPDATE catalogue_order SET state = ? WHERE id = ? AND state = 'reserved'", state, op.subject]], { onlyIfChanged: true });
+    await ctx.db.run('UPDATE provider_op SET settled = 1 WHERE id = ?', op.id);
+  }
+  return out;
+}
+/** The tick: finish order decisions that were cut short, and give back a hold reserved for an order that was never recorded. */
+export async function finishOrders(ctx, company) {
+  let n = 0;
+  for (const op of await unsettled(ctx, company.id, 'order_decide')) { try { if ((await driveOrder(ctx, company, op)).state === 'landed') n++; } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
+  for (const op of await unsettled(ctx, company.id, 'order_reserve')) {
+    if (await ctx.db.first('SELECT 1 x FROM catalogue_order WHERE id = ?', op.subject)) { await settleOp(ctx, op); continue; }
+    if (ctx.now() - op.created_at < 600_000) continue;
+    try {
+      const prov = ctx.provider(company);
+      const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', op.params.person);
+      const ref = await accountRef(ctx, company, person);
+      const res = await run(ctx, company, op, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: op.subject, idem: 'order:' + op.subject, item: p.item }));
+      if (res.state === 'refused') { await settleOp(ctx, op); continue; }
+      if (res.state !== 'landed') continue;
+      const rel = await intend(ctx, company, { kind: 'order_release', key: 'orel:' + op.subject, subject: op.subject, params: { hold: res.result.hold_id } });
+      const out = await run(ctx, company, rel, (p) => prov.releaseSpend({ holdId: p.hold, idem: 'orel:' + op.subject }), { okCodes: ['hold_expired'], believeRefusal: false });
+      if (out.state === 'landed') { await settleOp(ctx, rel); await settleOp(ctx, op); n++; }
+    } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  }
+  return n;
 }
 export async function decideOrder(ctx, company, actor, orderId, accept) {
   must(actor, 'admin', 'hr');
   const o = await ctx.db.first("SELECT * FROM catalogue_order WHERE id = ? AND company_id = ? AND state = 'reserved'", orderId, company.id);
   if (!o) throw new ApiError(404, 'no_order', 'No order waiting.');
   const state = accept ? 'captured' : 'released';
-  // Claim FIRST: of two overlapping decisions only one changes the row and calls the provider.
-  const claim = await ctx.db.run("UPDATE catalogue_order SET state = ? WHERE id = ? AND state = 'reserved'", state, o.id);
-  if (claim.changes === 0) throw new ApiError(409, 'already_decided', 'This order was already decided.');
-  try {
-    const prov = ctx.provider(company);
-    if (accept) await prov.captureSpend({ holdId: o.hold_id, idem: 'cap:' + o.id }); else await prov.releaseSpend({ holdId: o.hold_id, idem: 'rel:' + o.id });
-  } catch (e) { await ctx.db.run("UPDATE catalogue_order SET state = 'reserved' WHERE id = ? AND state = ?", o.id, state); throw e; }
-  await commit(ctx, company.id, actor.id, 'order.' + state, { id: o.id });
+  // ONE decision operation per order (key odec:<id>): the first decision fixes it, the second (even the opposite one) cannot call the provider.
+  const op = await intend(ctx, company, { kind: 'order_decide', key: 'odec:' + o.id, subject: o.id, params: { accept: !!accept, hold: o.hold_id } });
+  if (op.params.accept !== !!accept) throw new ApiError(409, 'already_decided', 'This order was already decided.');
+  const out = await driveOrder(ctx, company, op, actor.id);
+  if (out.state === 'refused') { await ctx.db.run("DELETE FROM provider_op WHERE id = ? AND state = 'refused'", op.id); throw new ApiError(502, out.code, 'The credit provider refused this decision.'); } // a clear first no: a new decision may be tried
+  if (out.state !== 'landed') throw new ApiError(502, out.code ?? 'provider_down', 'The credit provider did not confirm; the decision is kept and the tick finishes it.');
   return { id: o.id, state };
 }

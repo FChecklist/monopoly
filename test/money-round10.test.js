@@ -53,12 +53,12 @@ test('P3: the restore_pending marker is written BEFORE the credit, so a failing 
   w.db.batch = async (stmts) => { if (broke && stmts.some(([, ...p]) => p.includes('penalty.restore'))) throw new Error('audit chain is busy'); return orig(stmts); };
   await assert.rejects(restoreDebit(w.ctx, w.company, c.id, 100, 0), /busy/);
   assert.equal(await bal(), before + 100, 'the credit reached the provider');
-  assert.equal(await auditCount(w, 'penalty.restore_pending'), 1, 'marker exists although the receipt failed');
+  assert.equal((await w.db.first("SELECT COUNT(*) n FROM provider_op WHERE kind='restore' AND settled=0")).n, 1, 'the restore operation exists (unsettled) although the receipt failed');
   broke = false;
   await tickPenalties(w.ctx, w.company); await tickPenalties(w.ctx, w.company);
   assert.equal(await bal(), before + 100, 'same key: not credited twice');
   assert.equal(await auditCount(w, 'penalty.restore'), 1);
-  assert.equal(await auditCount(w, 'penalty.restore_pending'), 1);
+  assert.equal((await w.db.first("SELECT COUNT(*) n FROM provider_op WHERE kind='restore' AND settled=1")).n, 1);
 });
 
 test('P4: a restore that fails for good is tried at most 5 times, then shows as open_restores_failed', async () => {

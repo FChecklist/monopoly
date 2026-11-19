@@ -37,8 +37,8 @@ test('S2: a hold reserved for a raise whose commit failed is released by the tic
   const orig = w.db.batch.bind(w.db); let boom = true;
   w.db.batch = async (st) => { if (boom && st.some(([, ...p]) => p.includes('season.budget'))) { boom = false; throw new Error('crash'); } return orig(st); };
   await setup.raiseBudget(w.ctx, w.company, w.admin, w.season, 2000).catch(() => {});
-  const orphan = (await w.db.first("SELECT data FROM audit WHERE action='season.hold_new'")).data;
-  const orphanId = JSON.parse(orphan).hold;
+  const orphan = (await w.db.first("SELECT result FROM provider_op WHERE kind='hold_reserve' ORDER BY rowid LIMIT 1")).result;
+  const orphanId = JSON.parse(orphan).hold_id;
   await setup.raiseBudget(w.ctx, w.company, w.admin, w.season, 2500);
   w.clock.t += 11 * 60_000;
   await retryQueued(w.ctx, w.company);

@@ -85,8 +85,9 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
 
 /** One 'period.settle_error' line per (group, code) until the code changes: a stuck entry must not grow the audit chain at every tick. */
 async function logSettleError(ctx, company, data) {
-  const last = await ctx.db.first("SELECT data FROM audit WHERE company_id = ? AND action = 'period.settle_error' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"group":"${data.group}"`);
-  try { if (last && JSON.parse(last.data).code === data.code) return; } catch { /* write it */ }
+  // One line per (group, code) until the code changes, and never more than one per group per day (a flapping code must not grow the chain).
+  const last = await ctx.db.first("SELECT data, at FROM audit WHERE company_id = ? AND action = 'period.settle_error' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"group":"${data.group}"`);
+  try { if (last && (JSON.parse(last.data).code === data.code || ctx.now() - last.at < DAY)) return; } catch { /* write it */ }
   await commit(ctx, company.id, 'system', 'period.settle_error', data);
 }
 const BLOCK_TTL = 24 * 3600_000; // a block expires: the entry is tried again after a day

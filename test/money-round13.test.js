@@ -109,7 +109,7 @@ test('T5d: retrying a raise at the same budget after the orphan hold was release
   const orig = w.db.batch.bind(w.db); let boom = true;
   w.db.batch = async (st) => { if (boom && st.some(([, ...p]) => p.includes('season.budget'))) { boom = false; throw new Error('crash'); } return orig(st); };
   await setup.raiseBudget(w.ctx, w.company, w.admin, w.season, 2000).catch(() => {});
-  const orphan = JSON.parse((await w.db.first("SELECT data FROM audit WHERE action='season.hold_new' ORDER BY n DESC LIMIT 1")).data).hold;
+  const orphan = JSON.parse((await w.db.first("SELECT result FROM provider_op WHERE kind='hold_reserve' ORDER BY rowid DESC LIMIT 1")).result).hold_id;
   w.clock.t += 11 * 60_000; await retryQueued(w.ctx, w.company);
   assert.equal((await w.db.first('SELECT remaining r FROM stub_hold WHERE id=?', orphan)).r, 0);
   await setup.raiseBudget(w.ctx, w.company, w.admin, w.season, 2000);

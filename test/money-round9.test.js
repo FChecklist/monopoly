@@ -88,7 +88,7 @@ test('N5: a lost-race debit whose restore hits an outage is finished by the tick
   w.ctx.provider = () => wrap(real, { credit: async (x) => { if (down) throw new ProviderError('provider_down'); return real.credit(x); } });
   await restoreDebit(w.ctx, w.company, c.id, 100, 0);
   assert.equal(await bal(), before, 'nothing restored yet');
-  assert.equal((await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='penalty.restore_pending'")).n, 1);
+  assert.equal((await w.db.first("SELECT COUNT(*) n FROM provider_op WHERE kind='restore' AND settled=0")).n, 1);
   down = false;
   await tickPenalties(w.ctx, w.company); await tickPenalties(w.ctx, w.company);
   assert.equal(await bal(), before + 100);

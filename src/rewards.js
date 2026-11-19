@@ -8,6 +8,7 @@ import { settingsOf, DEFAULTS } from './config.js';
 import { commit } from './audit.js';
 import { newId, monthKey, dayKey, DAY } from './util.js';
 import { ProviderError, RETRIABLE_CODES } from './provider/errors.js';
+import { intend, getOp, run, settleOp, unsettled, openOps } from './provider-ops.js';
 
 const COUNT = "('queued','sent','waiting','recorded')";
 const FUNDED = "('queued','sent')";
@@ -180,8 +181,8 @@ export async function sendReward(ctx, company, r) {
     if (!(e instanceof ProviderError)) throw e;
     if (e.retriable || isTransient(e.code)) { // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
       await ctx.db.run('UPDATE reward SET last_error=? WHERE id=?', e.code, r.id);
-      // One audit line per CHANGE of code (not per try), so a long outage never grows the audit chain.
-      if (r.last_error !== e.code) { try { await commit(ctx, company.id, 'system', 'reward.send_error', { id: r.id, code: e.code }); } catch { /* the next try writes it */ } }
+      // At most ONE audit line per row per day (a flapping code A,B,A,B must not write at every change), so a long outage never grows the audit chain.
+      if (r.last_error !== e.code && !(await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.send_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, `"id":"${r.id}"`))) { try { await commit(ctx, company.id, 'system', 'reward.send_error', { id: r.id, code: e.code }); } catch { /* the next try writes it */ } }
     }
     else if (e.code === 'insufficient_budget' || e.code === 'hold_expired') await backToWaiting(ctx, company, r, e.code);
     else if (await ambiguousTry(ctx, r)) {
@@ -247,28 +248,14 @@ export async function voidFailedReward(ctx, company, r, reason = 'event_reversed
   await commit(ctx, company.id, 'system', 'reward.void', { orig: r.id, reason }, [["UPDATE reward SET state='void', reversed=1, last_error=? WHERE id=? AND state='failed'", reason, r.id]], { onlyIfChanged: true });
 }
 
-const MAX_REVERSE_TRIES = 5;
-const reverseTries = async (ctx, company, id) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'reward.reverse_failed' AND instr(data, ?) > 0", company.id, `"id":"${id}"`)).n;
-/** Rows whose reverse stopped retrying after MAX_REVERSE_TRIES permanent answers (admin overview: open_reverses_failed). */
-export async function openReversesFailed(ctx, companyId) {
-  const tries = new Map();
-  for (const r of await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'reward.reverse_failed'", companyId)) { try { const k = JSON.parse(r.data).id; tries.set(k, (tries.get(k) ?? 0) + 1); } catch { /* skip */ } }
-  let n = 0;
-  for (const [id, t] of tries) if (t >= MAX_REVERSE_TRIES && (await ctx.db.first("SELECT 1 x FROM reward WHERE id = ? AND reversed = 0 AND state = 'sent'", id))) n++;
-  return n;
-}
-/** A reverse call is about to go out: leave a marker FIRST (once per row), so a lost answer is finished before the row is trusted as paid. */
-async function markReversePending(ctx, company, r, reason, eventId) {
-  if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0", company.id, `"id":"${r.id}"`)) return true; // an earlier reverse call may have landed
-  await commit(ctx, company.id, 'system', 'reward.reverse_pending', { id: r.id, reason: String(reason ?? 'reversal').slice(0, 80), event: eventId ?? null });
-}
-/** Re-run the idempotent reverse (key rev:<entry>) of rows of this group whose reverse call may have been cut short, before anybody counts them as paid. */
+export const openReversesFailed = (ctx, companyId) => openOps(ctx, companyId, ['reverse']);
+/** Re-run the idempotent reverse (key rev:<entry>) of rows whose reverse operation is not settled (a lost reply, a crash), before anybody counts them as paid. */
 export async function healPendingReverses(ctx, company, personId, groupKey) {
   let healed = 0;
-  for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='sent' AND reversed=0 AND amount>0 AND kind != 'reversal'", company.id, personId, groupKey)) {
-    const m = await ctx.db.first("SELECT data FROM audit WHERE company_id = ? AND action = 'reward.reverse_pending' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"id":"${r.id}"`);
-    if (!m) continue;
-    let d = {}; try { d = JSON.parse(m.data); } catch { /* default reason */ }
+  try { if (!(await ctx.provider(company).capabilities()).reverse) return 0; } catch (e) { if (e instanceof ProviderError) return 0; throw e; } // a provider that cannot reverse has nothing to heal
+  for (const op of (await ctx.db.all("SELECT o.* FROM provider_op o JOIN reward r ON r.id = o.subject WHERE o.company_id = ? AND o.kind = 'reverse' AND o.settled = 0 AND r.person_id = ? AND r.group_key = ? AND r.state = 'sent' AND r.reversed = 0", company.id, personId, groupKey))) {
+    let d = {}; try { d = JSON.parse(op.params); } catch { /* default */ }
+    const r = await ctx.db.first('SELECT * FROM reward WHERE id = ?', op.subject);
     const o = await reverseReward(ctx, company, r, { reason: d.reason ?? 'reversal', actor: 'system', eventId: d.event ?? null });
     if (!o.skipped) healed += r.amount;
   }
@@ -280,7 +267,8 @@ export async function retryQueued(ctx, company, limit = 100) {
   let sent = 0, stuck = 0;
   limit = Math.max(1, Math.min(1000, Number(limit) | 0 || 100));
   for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id=? AND state='queued' ORDER BY attempts, created_at LIMIT ?", company.id, limit)) { // fewest tries first: a row that can never be sent cannot starve newer ones
-    const out = await sendReward(ctx, company, r);
+    let out;
+    try { out = await sendReward(ctx, company, r); } catch { stuck++; continue; } // one bad row never stops the others (it is tried again at the next tick)
     if (out.state === 'sent') sent++;
     else if (ctx.now() - r.created_at > 24 * 3600_000) stuck++;
   }
@@ -292,53 +280,46 @@ export async function retryQueued(ctx, company, limit = 100) {
  * A season closed while some of its rewards were still queued (provider outage) keeps its budget hold, because those rewards draw from it.
  * Once none is queued any more the hold is released and forgotten. Idempotent; a provider problem just leaves it for the next tick.
  */
+/** Give a hold back through the operation state machine (one release operation per hold, replayed until the provider confirms). Returns the released amount, or null while unconfirmed. */
+export async function releaseHoldOp(ctx, company, holdId, seasonId) {
+  const op = await intend(ctx, company, { kind: 'hold_release', key: 'hrel:' + holdId, subject: seasonId, params: { hold: holdId } });
+  return driveHoldRelease(ctx, company, op);
+}
+async function driveHoldRelease(ctx, company, op) {
+  let prov;
+  try { prov = ctx.provider(company); if (!(await prov.capabilities()).hold) return null; } catch (e) { if (e instanceof ProviderError) return null; throw e; }
+  const res = await run(ctx, company, op, (p) => prov.releaseHold({ holdId: p.hold }), { okCodes: ['hold_expired'], believeRefusal: false }); // a release that is refused is NOT done: it is replayed, never forgotten
+  if (res.state !== 'landed') return null;
+  if (await settleOp(ctx, op)) await commit(ctx, company.id, 'system', 'season.hold_freed', { id: op.subject, hold: op.params.hold });
+  return res.result?.released ?? 0;
+}
 /**
- * Holds that must go back to the company and have not: the OLD hold of a raised budget (season.budget line with 'old'), and a hold that was reserved for a raise
- * whose commit then failed (season.hold_new that is not the season's hold, older than 10 minutes so a raise in flight is never touched).
- * Each is released until the provider confirms ('season.hold_freed'); a provider problem just leaves it for the next tick. Returns how many went back.
+ * Hold housekeeping, driven by the tick: (1) every release operation that is not confirmed is replayed; (2) a reserve operation older than 10 minutes that was never
+ * recorded on its season (a lost reply, a failed commit, a lost race) is replayed with ITS key to learn the hold, and that hold is released unless it is the season's hold.
  */
 export async function releasePendingHolds(ctx, company) {
-  let freed = 0;
   let prov;
   try { prov = ctx.provider(company); if (!(await prov.capabilities()).hold) return 0; } catch (e) { if (e instanceof ProviderError) return 0; throw e; }
-  const todo = new Map(), intents = new Map(), made = new Set();
-  for (const r of await ctx.db.all("SELECT action, data, at FROM audit WHERE company_id = ? AND action IN ('season.budget','season.hold_new','season.hold_intent') ORDER BY n", company.id)) {
-    let d; try { d = JSON.parse(r.data); } catch { continue; }
-    if (r.action === 'season.budget' && d.old) todo.set(d.old, { hold: d.old, season: d.id, at: 0 });
-    if (r.action === 'season.hold_intent' && d.key) intents.set(d.key, { ...d, at: r.at });
-    if (r.action === 'season.hold_new' && d.hold) { todo.set(d.hold, { hold: d.hold, season: d.id, at: r.at, orphanCheck: true }); if (d.key) made.add(d.key); }
-  }
-  // A reserve whose answer was lost (no hold_new line after the intent): replay it with its own key to learn the hold, and keep it only if it is the season's hold.
-  for (const [key, it] of intents) {
-    if (made.has(key) || ctx.now() - it.at < 600_000) continue;
-    try {
-      const se = await ctx.db.first('SELECT name, hold_id FROM season WHERE id = ?', it.id);
-      if (!se) continue;
-      const h = await prov.reserveBudget({ amount: it.amount, name: se.name, idem: key });
-      await commit(ctx, company.id, 'system', 'season.hold_new', { id: it.id, hold: h.hold_id, key });
-      todo.set(h.hold_id, { hold: h.hold_id, season: it.id, at: 0, orphanCheck: true });
-    } catch (e) { if (!(e instanceof ProviderError)) throw e; }
-  }
-  for (const t of todo.values()) {
-    if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'season.hold_freed' AND instr(data, ?) > 0", company.id, `"hold":"${t.hold}"`)) continue;
-    if (t.orphanCheck) {
-      if (ctx.now() - t.at < 600_000) continue;
-      const se = await ctx.db.first('SELECT hold_id FROM season WHERE id = ?', t.season);
-      if (!se || se.hold_id === t.hold) continue;
-    }
-    try { await prov.releaseHold({ holdId: t.hold }); } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') continue; }
-    await commit(ctx, company.id, 'system', 'season.hold_freed', { id: t.season, hold: t.hold });
-    freed++;
+  let freed = 0;
+  for (const op of await unsettled(ctx, company.id, 'hold_release')) if ((await driveHoldRelease(ctx, company, op)) !== null) freed++;
+  for (const op of await unsettled(ctx, company.id, 'hold_reserve')) {
+    if (ctx.now() - op.created_at < 600_000) continue;
+    const res = await run(ctx, company, op, (p) => prov.reserveBudget({ amount: p.amount, name: p.name, idem: op.key }));
+    if (res.state === 'refused') { await settleOp(ctx, op); continue; }
+    if (res.state !== 'landed') continue;
+    const hold = res.result?.hold_id;
+    const se = await ctx.db.first('SELECT hold_id FROM season WHERE id = ?', op.subject);
+    if (se?.hold_id !== hold && hold) { const rel = await intend(ctx, company, { kind: 'hold_release', key: 'hrel:' + hold, subject: op.subject, params: { hold } }); if ((await driveHoldRelease(ctx, company, rel)) !== null) freed++; }
+    await settleOp(ctx, op);
   }
   return freed;
 }
-/** Give a closed season's hold back and write the line. Returns the amount, or null while the provider cannot do it (the tick tries again). */
+/** Give a closed season's hold back and write the line. Returns the amount, or null while the provider cannot confirm (the tick tries again). */
 export async function releaseSeasonHold(ctx, company, se) {
   let amount = 0;
-  try {
-    const prov = ctx.provider(company);
-    if ((await prov.capabilities()).hold) amount = (await prov.releaseHold({ holdId: se.hold_id })).released ?? 0;
-  } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.code !== 'hold_expired') return null; }
+  let hasHold = true;
+  try { hasHold = (await ctx.provider(company).capabilities()).hold; } catch (e) { if (e instanceof ProviderError) return null; throw e; }
+  if (hasHold) { amount = await releaseHoldOp(ctx, company, se.hold_id, se.id); if (amount === null) return null; }
   await commit(ctx, company.id, 'system', 'season.hold_released', { id: se.id });
   return amount;
 }
@@ -460,22 +441,19 @@ export async function reverseReward(ctx, company, r, { reason, actor = 'system',
   }
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id=?', r.person_id);
   let reversed = 0, owed = r.sent_amount ?? r.amount;
-  let earlierTry = false;
+  let rop = null;
   if (r.provider_ref && r.provider_ref !== 'offset') {
     let prov, canReverse;
     // A provider/config problem (unsupported, misconfigured, unauthorized, down) is never permanent for a reversal: the row stays due and the next tick retries.
     try { prov = ctx.provider(company); canReverse = (await prov.capabilities()).reverse; } catch (e) { if (!(e instanceof ProviderError)) throw e; return { reversed: 0, owed: 0, skipped: true, pending: true, code: e.code }; }
     if (canReverse) {
-      try {
-        earlierTry = await markReversePending(ctx, company, r, reason, eventId);
-        if (earlierTry && (await reverseTries(ctx, company, r.id)) >= MAX_REVERSE_TRIES) return { reversed: 0, owed: 0, skipped: true, pending: true, code: 'reverse_failed' }; // gave up: shown as open_reverses_failed
-        const out = await prov.reverse({ entryId: r.provider_ref, reasonCode: 'reversal', idem: 'rev:' + r.provider_ref });
-        reversed = out.reversed; owed = out.owed ?? Math.max(0, (r.sent_amount ?? r.amount) - reversed);
-      } catch (e) {
-        if (!(e instanceof ProviderError)) throw e;
-        if (e.retriable) throw e;
-        if (earlierTry) { try { await commit(ctx, company.id, 'system', 'reward.reverse_failed', { id: r.id, code: e.code }); } catch { /* counted next time */ } throw e; }
-      } // a definitive 'no' after an earlier try that may have landed is not believed: no owed correction is booked, the next close retries
+      // The reverse is ONE provider operation (provider-ops.js): announced before the call, replayed with the same key (rev:<entry>), a refusal believed only on the first try.
+      rop = await intend(ctx, company, { kind: 'reverse', key: 'rev:' + r.provider_ref, subject: r.id, params: { entry: r.provider_ref, reason: String(reason ?? 'reversal').slice(0, 80), event: eventId ?? null } });
+      const res = await run(ctx, company, rop, () => prov.reverse({ entryId: r.provider_ref, reasonCode: 'reversal', idem: rop.key }));
+      if (res.state === 'landed') { reversed = res.result?.reversed ?? 0; owed = res.result?.owed ?? Math.max(0, (r.sent_amount ?? r.amount) - reversed); }
+      else if (res.state === 'refused') { /* a clear first "no": nothing was reversed, the whole credit is owed */ }
+      else if (res.exhausted || res.busy) return { reversed: 0, owed: 0, skipped: true, pending: true, code: 'reverse_pending' }; // gave up (open_reverses_failed) or another worker is deciding
+      else throw new ProviderError(res.code ?? 'provider_down', 'The reversal is not confirmed yet.', { retriable: true });
     }
   } else owed = 0; // fully offset: nothing was ever sent
   const stmts = [
@@ -488,7 +466,8 @@ export async function reverseReward(ctx, company, r, { reason, actor = 'system',
   if (owed > 0) stmts.push(["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, ?, ?)", newId('cr'), company.id, r.person_id, owed, reason, eventId ?? r.event_id, ctx.now()]);
   try {
     await commit(ctx, company.id, actor, 'reward.reverse', { ...base, reversed, owed, person: person?.id }, stmts);
-  } catch (e) { if (/idem_key/i.test(String(e?.message))) return { reversed: 0, owed: 0, skipped: true }; throw e; }
+  } catch (e) { if (/idem_key/i.test(String(e?.message))) { if (rop) await settleOp(ctx, rop); return { reversed: 0, owed: 0, skipped: true }; } throw e; }
+  if (rop) await settleOp(ctx, rop);
   return { reversed, owed };
 }
 

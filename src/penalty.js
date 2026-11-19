@@ -6,6 +6,7 @@ import { ApiError, newId, DAY, clean, monthKey } from './util.js';
 import { ensureBoard, enterLane, checkReset, finishLaneTask } from './board.js';
 import { accountRef, grant, earnedNet, sendReward, isTransient } from './rewards.js';
 import { ProviderError } from './provider/errors.js';
+import { intend, getOp, run, settleOp, unsettled, openOps } from './provider-ops.js';
 
 export const NOTICE_DAYS = 3, APPEAL_DAYS = 7, L1_DAYS = 3, L2_DAYS = 3, L3_DAYS = 5; // 3 + 3 + 5 = 11 days in all
 const EFFECTS = ['steps_back', 'points', 'credits', 'lane'];
@@ -112,7 +113,7 @@ const LIVE = `EXISTS (SELECT 1 FROM penalty_case WHERE id = ? AND ${OPEN_SQL})`;
  * case still being pending/appealed, so two ticks at once cannot take anything twice.
  */
 async function applyPenalty(ctx, company, c0) {
-  let dkey = null;
+  let dop = null; // the debit operation this apply used (settled once the case records it)
   const s = settingsOf(company);
   const c = await ctx.db.first(`SELECT * FROM penalty_case WHERE id = ? AND company_id = ? AND ${OPEN_SQL}`, c0.id, company.id);
   if (!c) return null;
@@ -132,46 +133,36 @@ async function applyPenalty(ctx, company, c0) {
   } else if (c.effect === 'credits') {
     // The setting and the provider's ability are checked again NOW, not only when it was proposed.
     const prov = ctx.provider(company);
-    dkey = debitIdem(c.id, gen);
-    // A debit that may already have landed (answer lost) is replayed with the SAME key and amount, never recomputed: the cap room moves once the debit exists.
-    const pend = await pendingDebit(ctx, company, dkey);
-    if ((pend || s.penalty_credit_loss) && (await prov.capabilities()).debit) {
+    const dkey = debitIdem(c.id, gen);
+    // The debit is ONE provider operation (provider-ops.js): announced before the call with its amount fixed, replayed with the same key, never recomputed.
+    let op = await getOp(ctx, company.id, dkey);
+    if ((op || s.penalty_credit_loss) && (await prov.capabilities()).debit) {
       const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', c.person_id);
-      let ask, room;
-      if (pend) { ask = pend.ask; room = pend.room; } else {
+      if (!op) {
         const mk = monthKey(ctx.now());
         const earned = await earnedNet(ctx, company.id, c.person_id, mk);
         const already = (await ctx.db.first("SELECT COALESCE(SUM(applied_credits),0) s FROM penalty_case WHERE person_id = ? AND state IN ('applied','appealed','upheld') AND applied_at >= ?", c.person_id, ctx.now() - 31 * DAY)).s;
         const capPct = Math.min(50, s.penalty_cap_pct);
-        room = Math.max(0, Math.floor((earned * capPct) / 100) - already);
-        ask = Math.min(c.amount, room);
-        if (ask > 0) await commit(ctx, company.id, 'system', 'penalty.debit_pending', { id: c.id, key: dkey, ask, room, gen }); // BEFORE the provider call
+        const room = Math.max(0, Math.floor((earned * capPct) / 100) - already);
+        const ask = Math.min(c.amount, room);
+        if (ask > 0) op = await intend(ctx, company, { kind: 'debit', key: dkey, subject: c.id, params: { ask, room, gen } });
       }
-      if (ask > 0) {
-        try {
-          const out = await prov.debit({ accountRef: await accountRef(ctx, company, person), amount: ask, reasonCode: 'penalty', ref: c.id, idem: dkey, monthlyCap: room });
-          upd.credits = out.debited; // may be less than asked, never below zero, never spent credits
-        } catch (e) {
-          if (!(e instanceof ProviderError)) throw e;
-          const transient = e.retriable || (isTransient(e.code) && e.code !== 'unsupported' && e.code !== 'insufficient_credits');
-          if ((pend || (await markerCount(ctx, company, dkey)) > 1) && !transient) { // an earlier try may have landed: a definitive 'no' now is not believed, the case stays pending (retried up to MAX_DEBIT_TRIES, then shown as open_debits_failed)
-            if ((await debitTries(ctx, company, dkey)) < MAX_DEBIT_TRIES) { try { await commit(ctx, company.id, 'system', 'penalty.debit_failed', { id: c.id, key: dkey, code: e.code }); } catch { /* counted next time */ } }
-            return null;
-          }
-          if (e.code === 'unsupported' || e.code === 'insufficient_credits') upd.nodebit = e.code; // no debit happened: the case is applied without credits and the reason is on the audit line
-          else if (e.retriable || isTransient(e.code)) return null; // may have landed: the marker makes the retry replay it
-          else upd.nodebit = e.code; // a definitive refusal
-        }
+      if (op) {
+        const ref = await accountRef(ctx, company, person);
+        const out = await run(ctx, company, op, (p) => prov.debit({ accountRef: ref, amount: p.ask, reasonCode: 'penalty', ref: c.id, idem: dkey, monthlyCap: p.room }));
+        if (out.state === 'landed') { upd.credits = out.result?.debited ?? 0; dop = op; } // may be less than asked, never below zero, never spent credits
+        else if (out.state === 'refused') { upd.nodebit = out.code; dop = op; } // a clear first "no": nothing was taken
+        else return null; // unknown (a lost reply, an outage, a "no" after an earlier try) or another worker is deciding: the case stays open, the same key is replayed
       }
     }
   }
   stmts.push([`UPDATE penalty_case SET ${c.state === 'upheld' ? '' : "state='applied', "}applied_at=?, applied_steps=?, applied_points=?, applied_credits=?, prev_pos=? WHERE id=? AND ${OPEN_SQL}`, ctx.now(), upd.steps, upd.points, upd.credits, upd.prev, c.id]);
   const res = await commit(ctx, company.id, 'system', 'penalty.apply', { id: c.id, ...upd }, stmts, { onlyIfChanged: true });
   if (res[stmts.length - 1].changes === 0) { // somebody else applied or reversed it first
-    try { await restoreDebit(ctx, company, c.id, upd.credits, gen); } catch { /* the debit_pending marker is still open: finishDebits (the tick) hands it back */ }
+    try { await restoreDebit(ctx, company, c.id, upd.credits, gen); } catch { /* the debit operation stays unsettled: finishDebits (the tick) hands it back */ }
     return null;
   }
-  if (dkey) await resolveDebit(ctx, company, c.id, dkey);
+  if (dop) await settleOp(ctx, dop);
   if (c.effect === 'points') await checkReset(ctx, company, c.person_id);
   return upd;
 }
@@ -182,61 +173,36 @@ async function applyPenalty(ctx, company, c0) {
  */
 /** How many times the debit of this case was handed back (restoreDebit). Each hand-back ends a debit for good, so the next debit needs a new key. */
 const restoresOf = async (ctx, company, caseId) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"id":"${caseId}"`)).n;
-/** The debit that was announced (debit_pending) and not yet settled (debit_resolved), or null. */
-async function pendingDebit(ctx, company, key) {
-  const m = await ctx.db.first("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.debit_pending' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"key":"${key}"`);
-  if (!m) return null;
-  if (await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'penalty.debit_resolved' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)) return null;
-  try { return JSON.parse(m.data); } catch { return null; }
-}
-const MAX_DEBIT_TRIES = 5;
-const markerCount = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.debit_pending' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n; // re-read: an overlapping tick may have announced it meanwhile
-const debitTries = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.debit_failed' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n;
-/** Debits that stopped retrying (admin overview: open_debits_failed). */
-export async function openDebitsFailed(ctx, companyId) {
-  const tries = new Map();
-  for (const r of await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.debit_failed'", companyId)) { try { const k = JSON.parse(r.data).key; tries.set(k, (tries.get(k) ?? 0) + 1); } catch { /* skip */ } }
-  let n = 0; for (const [k, t] of tries) if (t >= MAX_DEBIT_TRIES && (await pendingDebit(ctx, { id: companyId }, k))) n++;
-  return n;
-}
-async function resolveDebit(ctx, company, id, key) { try { await commit(ctx, company.id, 'system', 'penalty.debit_resolved', { id, key }); } catch { /* the tick writes it */ } }
+/** Debit and restore operations that used up their tries (admin overview). */
+export const openDebitsFailed = (ctx, companyId) => openOps(ctx, companyId, ['debit']);
+export const openRestoresFailed = (ctx, companyId) => openOps(ctx, companyId, ['restore']);
+const debitIdem = (caseId, g) => { return g ? `pen:${caseId}:g${g}` : 'pen:' + caseId; };
+
 /**
- * An announced debit whose case was reversed (an appeal won) or closed before the debit was ever recorded on it: replay the SAME debit (same key and amount, so it
- * cannot take twice) to learn what it took, and give that back. If the debit never landed, replaying it and handing it back nets to zero.
+ * Drive every unsettled debit to a record. The case is the record: if it holds the debit (applied_credits > 0) the operation is settled; if the case will still be applied,
+ * that apply uses the operation; otherwise (reversed, or applied with 0 credits by a worker that did not know) the SAME debit is replayed to learn what it took
+ * and that is given back. Nothing here depends on how many workers raced or in which order they got their answers.
  */
 async function finishDebits(ctx, company) {
   let n = 0;
-  const seen = new Set();
-  for (const r of await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.debit_pending' ORDER BY n", company.id)) {
-    let d; try { d = JSON.parse(r.data); } catch { continue; }
-    if (!d?.key || seen.has(d.key)) continue; seen.add(d.key);
-    if (!(await pendingDebit(ctx, company, d.key))) continue;
-    const c = await ctx.db.first('SELECT state, applied_at, applied_credits, person_id FROM penalty_case WHERE id = ?', d.id);
-    if (!c) continue;
-    if (c.applied_credits > 0 || c.applied_at) { await resolveDebit(ctx, company, d.id, d.key); continue; }
-    if (['proposed', 'pending', 'appealed', 'upheld'].includes(c.state)) continue; // will still be applied: that replays the marker
-    const rk = 'penrestore:' + d.id + (d.gen ? ':g' + d.gen : '');
-    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${rk}"`)).n > 0) { await resolveDebit(ctx, company, d.id, d.key); continue; }
-    if ((await debitTries(ctx, company, d.key)) >= MAX_DEBIT_TRIES) continue; // gave up: open_debits_failed
-    let took = 0;
+  for (const op of await unsettled(ctx, company.id, 'debit')) {
+    if (op.state === 'refused') { await settleOp(ctx, op); continue; }
+    const c = await ctx.db.first('SELECT state, applied_at, applied_credits, person_id FROM penalty_case WHERE id = ?', op.subject);
+    if (!c || c.applied_credits > 0) { await settleOp(ctx, op); continue; }
+    if (!c.applied_at && ['proposed', 'pending', 'appealed', 'upheld'].includes(c.state)) continue;
     try {
-      const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', c.person_id);
       const prov = ctx.provider(company);
-      if ((await prov.capabilities()).debit) took = (await prov.debit({ accountRef: await accountRef(ctx, company, person), amount: d.ask, reasonCode: 'penalty', ref: d.id, idem: d.key, monthlyCap: d.room })).debited ?? 0;
-    } catch (e) {
-      if (!(e instanceof ProviderError)) throw e;
-      if (e.retriable || (isTransient(e.code) && e.code !== 'unsupported' && e.code !== 'insufficient_credits')) continue;
-      // A definitive "no" to a replay of a debit that may have landed is not believed: it stays pending (up to MAX_DEBIT_TRIES, then open_debits_failed).
-      if ((await debitTries(ctx, company, d.key)) < MAX_DEBIT_TRIES) { try { await commit(ctx, company.id, 'system', 'penalty.debit_failed', { id: d.id, key: d.key, code: e.code }); } catch { /* counted next time */ } }
-      continue;
-    }
-    if (took > 0) await restoreDebit(ctx, company, d.id, took, d.gen ?? 0);
-    await resolveDebit(ctx, company, d.id, d.key); n++;
+      if (!(await prov.capabilities()).debit) continue;
+      const ref = await accountRef(ctx, company, await ctx.db.first('SELECT * FROM app_user WHERE id = ?', c.person_id));
+      const out = await run(ctx, company, op, (p) => prov.debit({ accountRef: ref, amount: p.ask, reasonCode: 'penalty', ref: op.subject, idem: op.key, monthlyCap: p.room }));
+      if (out.state === 'landed') { const took = out.result?.debited ?? 0; if (took > 0) await restoreDebit(ctx, company, op.subject, took, op.params.gen ?? 0); await settleOp(ctx, op); n++; }
+      else if (out.state === 'refused') await settleOp(ctx, op);
+    } catch (e) { if (!(e instanceof ProviderError)) throw e; }
   }
   return n;
 }
-const debitIdem = (caseId, g) => { return g ? `pen:${caseId}:g${g}` : 'pen:' + caseId; };
 
+/** Hand the credits of a lost-race or unrecorded debit back. One restore operation per (case, generation); it is replayed until the provider confirms. */
 export async function restoreDebit(ctx, company, caseId, credits, gen) {
   if (!(credits > 0)) return;
   const now = await ctx.db.first('SELECT state, applied_credits, person_id FROM penalty_case WHERE id = ?', caseId);
@@ -245,48 +211,38 @@ export async function restoreDebit(ctx, company, caseId, credits, gen) {
   if (now.state === 'reversed' && now.applied_credits > 0) return; // the winner recorded this debit; the penrev: hand-back owns it
   if (gen === undefined) gen = await restoresOf(ctx, company, caseId); // direct callers only; applyPenalty passes the generation it debited with
   const key = 'penrestore:' + caseId + (gen ? ':g' + gen : '');
+  if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n > 0) return; // this restore is already recorded
+  const op = await intend(ctx, company, { kind: 'restore', key, subject: caseId, params: { credits, gen: gen ?? 0, person: now.person_id } });
+  await driveRestore(ctx, company, op);
+}
+async function driveRestore(ctx, company, op) {
+  let out;
   try {
-    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n > 0) return; // this restore is already recorded
-    // The pending marker goes in BEFORE the credit (once per key): if the credit lands and our receipt then fails for any reason, the tick finishes it with the same key.
-    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore_pending' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n === 0) await commit(ctx, company.id, 'system', 'penalty.restore_pending', { id: caseId, credits, key });
-    const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', now.person_id);
-    await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: credits, reasonCode: 'penalty_restore', ref: caseId, idem: key });
-    await commit(ctx, company.id, 'system', 'penalty.restore', { id: caseId, credits, key }); // the debit is over: a later debit of this case is a NEW debit (new key)
-  } catch (e) {
-    if (!(e instanceof ProviderError)) throw e;
-    // The pending marker already exists. A PERMANENT error is counted (penalty.restore_failed) so the tick stops after MAX_RESTORE_TRIES; a transient one is not logged at all.
-    if (!e.retriable && !isTransient(e.code)) { try { await commit(ctx, company.id, 'system', 'penalty.restore_failed', { id: caseId, key, code: e.code }); } catch { /* the next try counts again */ } }
-  }
+    const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', op.params.person);
+    const ref = await accountRef(ctx, company, person);
+    // A refusal of a restore is never believed (believeRefusal: false): losing the person's credits is worse than asking again; after the tries it shows in the overview.
+    out = await run(ctx, company, op, (p) => ctx.provider(company).credit({ accountRef: ref, amount: p.credits, reasonCode: 'penalty_restore', ref: op.subject, idem: op.key }), { believeRefusal: false });
+  } catch (e) { if (!(e instanceof ProviderError)) throw e; return; }
+  if (out.state !== 'landed') return;
+  // the receipt first, then settled: a failing receipt (audit busy) leaves the operation open and the tick writes it. The debit is over: a later debit of this case is a NEW debit (new key).
+  const tag = '"key":"' + op.key + '"';
+  await commit(ctx, company.id, 'system', 'penalty.restore', { id: op.subject, credits: op.params.credits, key: op.key }, [], { onlyIf: { sql: "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0)", params: [company.id, tag] } }); // once, even when two workers get here
+  await settleOp(ctx, op);
 }
-
-const MAX_RESTORE_TRIES = 5;
-const restoreTries = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore_failed' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n;
-/** Restores that gave up after MAX_RESTORE_TRIES permanent provider errors (admin overview: open_restores_failed). */
-export async function openRestoresFailed(ctx, companyId) {
-  const tries = new Map(), done = new Set();
-  for (const r of await ctx.db.all("SELECT action, data FROM audit WHERE company_id = ? AND action IN ('penalty.restore_failed','penalty.restore','penalty.restore_skipped')", companyId)) {
-    let d; try { d = JSON.parse(r.data); } catch { continue; }
-    if (!d?.key) continue;
-    if (r.action === 'penalty.restore_failed') tries.set(d.key, (tries.get(d.key) ?? 0) + 1); else done.add(d.key);
-  }
-  let n = 0; for (const [k, t] of tries) if (t >= MAX_RESTORE_TRIES && !done.has(k)) n++;
-  return n;
-}
-/** Finish restores that were cut short (provider down while a lost-race debit was being handed back). Idempotent: same key as the first try. */
+/** Finish restores that were cut short (provider down, a lost reply, a crash). Same key as the first try: once only. */
 async function finishRestores(ctx, company) {
   let done = 0;
-  const rows = await ctx.db.all("SELECT data FROM audit WHERE company_id = ? AND action = 'penalty.restore_pending' ORDER BY n", company.id);
-  const seen = new Set();
-  for (const r of rows) {
-    let d; try { d = JSON.parse(r.data); } catch { continue; }
-    if (!d?.key || seen.has(d.key)) continue; seen.add(d.key);
-    if ((await restoreTries(ctx, company, d.key)) >= MAX_RESTORE_TRIES) continue; // gave up: shown as open_restores_failed
-    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action IN ('penalty.restore','penalty.restore_skipped') AND instr(data, ?) > 0", company.id, `"key":"${d.key}"`)).n > 0) continue;
-    const c = await ctx.db.first('SELECT state, applied_credits FROM penalty_case WHERE id = ?', d.id);
-    if (!c || c.applied_credits > 0) { await commit(ctx, company.id, 'system', 'penalty.restore_skipped', { id: d.id, key: d.key }); continue; } // the winner recorded this debit: nothing to restore
-    const g = d.key.includes(':g') ? Number(d.key.split(':g')[1]) : 0;
-    await restoreDebit(ctx, company, d.id, d.credits, g);
-    if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${d.key}"`)).n > 0) done++;
+  for (const op of await unsettled(ctx, company.id, 'restore')) {
+    if (op.state !== 'landed') {
+      const c = await ctx.db.first('SELECT applied_credits FROM penalty_case WHERE id = ?', op.subject);
+      if (!c || c.applied_credits > 0) { // the winner recorded this debit: nothing to restore
+        await ctx.db.run("UPDATE provider_op SET state = 'refused', settled = 1 WHERE id = ? AND state != 'landed'", op.id);
+        await commit(ctx, company.id, 'system', 'penalty.restore_skipped', { id: op.subject, key: op.key });
+        continue;
+      }
+    }
+    await driveRestore(ctx, company, op);
+    if ((await ctx.db.first('SELECT settled s FROM provider_op WHERE id = ?', op.id)).s) done++;
   }
   return done;
 }

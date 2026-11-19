@@ -11,6 +11,7 @@ import * as R from './rewards.js';
 import * as AI from './aiapi.js';
 import { settleCompany, simulateBudget, countFor, tiersOf } from './periods.js';
 import { ProviderError } from './provider/errors.js';
+import { openOps, retryOps } from './provider-ops.js';
 
 const MAX_BODY = 1_500_000;
 
@@ -403,6 +404,7 @@ route('POST', '/api/admin/buy', async (c) => {
   catch (e) { if (e instanceof ProviderError) throw new ApiError(409, e.code, e.message); throw e; }
 });
 route('POST', '/api/admin/settle', async (c) => { adm(c); return settleCompany(c.ctx, c.company, c.ctx.now(), { force: c.body.force === true }); });
+route('POST', '/api/admin/retry-ops', async (c) => { adm(c); return retryOps(c.ctx, c.company); });
 route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin'); });
 route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });
@@ -428,6 +430,7 @@ route('GET', '/api/admin/overview', async (c) => {
     open_restores_failed: await Pen.openRestoresFailed(c.ctx, cid),
     open_debits_failed: await Pen.openDebitsFailed(c.ctx, cid),
     open_reverses_failed: await R.openReversesFailed(c.ctx, cid),
+    open_holds_failed: await openOps(c.ctx, cid, ['hold_reserve', 'hold_release', 'order_reserve', 'order_release', 'order_decide']),
     rewards_stuck: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
     rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
@@ -435,7 +438,7 @@ route('GET', '/api/admin/overview', async (c) => {
     used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
   };
   // One plain line per thing that needs an admin: no code, no names.
-  const say = { open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
+  const say = { open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
   return o;
 });
@@ -446,7 +449,7 @@ export async function tick(ctx, company) {
   return {
     sent: await R.retryQueued(ctx, company), released: await R.releaseWaiting(ctx, company), resumed: await E.resumeApproved(ctx, company),
     reversals: await E.processReversals(ctx, company), penalties: await Pen.tickPenalties(ctx, company), settled: await settleCompany(ctx, company, ctx.now()),
-    ai_resumed: await AI.resumeAiRuns(ctx, company), purged: await AI.purgeAiData(ctx, company),
+    orders: await S.finishOrders(ctx, company), ai_resumed: await AI.resumeAiRuns(ctx, company), purged: await AI.purgeAiData(ctx, company),
   };
 }
 
