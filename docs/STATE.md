@@ -1,5 +1,22 @@
 # STATE and HANDOVER (updated 19 Nov 2026, after audit round 27 / fix round 28)
 
+## PAUSED (19 Nov 2026, owner order via BOSS): all resources go to Priority 1. Work resumes later.
+- Code state: commit b79d7c3 (round 28), CI green. Nothing deployed; deploy hold stands; no company live.
+- Audit state: round 28A (code reading) FAIL, one MAJOR plus minors. Round 28B (scenario/fuzz) was still running when paused; its result is NOT recorded here. Two PASSes in a row on the same exact commit are still needed.
+- Money safety: no overpay or double pay found in the latest rounds. Open items are free-plan limit invariants and observability.
+- ROUND 29 FIX LIST (not started):
+  1. MAJOR: count rows read/written on every request (flush the counter at the end of each request in handle(); ROWS_FLUSH in src/api.js is defined but unused), including event intake, list routes, lazy tick, admin settle and season close.
+  2. Add migration 0012: indexes event(company_id, person_id, created_at) and event(company_id, status, created_at). The person index lacks created_at so each submit scans the person's history, and the applied-events list reads all applied events.
+  3. Add a counted daily rows-written guard (D1 free limit 100k/day) with an alert; show writes correctly in overview (events write about 12 rows each). Keep rows_read_high.
+  4. Route crawler test: use realistic bodies and ids, and fail on any 500.
+  5. Season close ends at exactly 50 calls: bring it well under.
+  6. 207 batch responses: make deferred results safe for naive clients (clear marker or non-2xx, no silent drop past 100).
+  7. UI event lists show only page 1 (50 rows): add paging or search so old events can be reversed.
+  8. Measure and bound CPU of the daily full streak read (10 ms free-plan limit).
+  9. tick-workflow.yml: add permissions block. scripts/tick.js: do not exit 0 on repeated 429. Retry back-off should apply when a failing visit changes the reward fingerprint. Migration 0011 ALTER is not idempotent by hand.
+  10. Add whatever 28B finds. New test file test/money-round29.test.js; then two fresh independent auditors (A code, B scenario) on the exact new commit.
+- Still needed before any deploy: owner's go; live Moneypenny contract test (MNP_LIVE=1); owner's trademark/subdomain decision; external tick driver on the free plan.
+
 Product code MON, code name `floor`. Owner: the product owner. Built from the owner design report dated 2026-11-17.
 
 ## Status in one line
