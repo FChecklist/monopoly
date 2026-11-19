@@ -77,49 +77,6 @@ test('R1 a credit above 500 is refused when it is configured (rate card, tier, s
   assert.equal(g.reward.state, 'failed'); assert.equal(g.reward.last_error, 'above_provider_max'); assert.equal(w.f.credits(), before, 'never sent');
 });
 
-test('R2 a partial grant is recorded, not topped up by itself; admin routes for top-up and revive are refused; re-issue needs the confirm flag and makes a NEW grant', async () => {
-  const w = await boot({ settings: { daily_event_limit: 1000, cap_event: 500 } }); await w.login('admin');
-  const f = fakeMnp({ lifetime: 100, now: () => w.clock.t });
-  const prov = new MoneypennyProvider({ baseUrl: 'https://mnp.test', keyId: 'k', secret: 's'.repeat(32) }, { fetchImpl: f.fetchImpl });
-  w.ctx.provider = () => prov; w.ctx.env = { ...w.ctx.env, FUTURE_OPS: undefined };
-  await w.db.run("UPDATE company SET provider = 'moneypenny' WHERE id = ?", w.company.id); await w.reload();
-  const g = await grant(w.ctx, w.company, { person: w.people.a, kind: 'tier', amount: 300, idem: 'r2', groupKey: 'g2', periodKey: 'W1', at: w.clock.t });
-  let r = await rowOf(w, g.reward.id);
-  assert.deepEqual([r.state, r.sent_amount, r.last_error], ['sent', 100, 'partial_grant']);
-  f.lifetime = 1000; const n0 = f.credits();
-  for (let i = 0; i < 12; i++) { w.clock.t += 7 * HOUR; await retryQueued(w.ctx, w.company); }
-  assert.equal(f.credits(), n0, 'no top-up call, ever');
-  await w.login('admin');
-  assert.equal((await w.call('admin', 'POST', '/api/admin/retry-partials', {})).status, 409);
-  assert.equal((await w.call('admin', 'POST', '/api/admin/revive-failed', {})).status, 409);
-  const ov = await w.call('admin', 'GET', '/api/admin/overview');
-  assert.equal(ov.json.open_partial_grants, 1); assert.ok(ov.json.alerts.some((a) => /Moneypenny ledger/.test(a) && /NEW grant/.test(a)));
-  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id })).status, 400, 'confirm is required');
-  const ok = await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' });
-  assert.equal(ok.status, 200, JSON.stringify(ok.json));
-  const nr = await rowOf(w, ok.json.new_reward);
-  assert.equal(nr.state, 'sent'); assert.equal(nr.amount, 200); assert.notEqual(nr.idem_key, r.idem_key);
-  r = await rowOf(w, g.reward.id); assert.equal(r.amount, 100); assert.equal(r.last_error, 'closed_partial');
-  assert.equal(f.total(A), 300); assert.ok(f.events.has('manual:' + nr.id) && !f.events.has(`manual:${g.reward.id}:r0`), 'a new reference, no :r<k>');
-  assert.equal((await w.call('admin', 'POST', '/api/admin/reissue', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' })).status, 404, 'the closed row cannot be re-issued again');
-  assert.equal(await w.db.first("SELECT COUNT(*) n FROM audit WHERE action='reward.reissued'").then((x) => x.n), 1);
-});
-
-test('R3 a reward the provider refused for good is not retried or revived; re-issue closes it and sends a new one', async () => {
-  const w = await mworld({ lifetime: 0 });
-  const g = await G(w, { amount: 80, idem: 'r3' });
-  assert.equal(g.reward.state, 'failed'); const n0 = w.f.credits();
-  for (let i = 0; i < 10; i++) { w.clock.t += 26 * HOUR; await retryQueued(w.ctx, w.company); await tick(w.ctx, w.company); }
-  assert.equal(w.f.credits(), n0, 'nothing is sent again by itself');
-  assert.equal(await openFailedRewards(w.ctx, w.company.id), 1);
-  await assert.rejects(reissueReward(w.ctx, w.company, 'admin', { id: g.reward.id }), (e) => e.code === 'confirm_required');
-  w.f.lifetime = 800;
-  const out = await reissueReward(w.ctx, w.company, 'admin', { id: g.reward.id, confirm: true, note: 'ledger checked, credit not there' });
-  const old = await rowOf(w, g.reward.id), nr = await rowOf(w, out.new_reward);
-  assert.deepEqual([old.state, old.last_error], ['void', 'reissued']); assert.equal(nr.state, 'sent'); assert.equal(w.f.total(A), 80);
-  assert.equal(await openFailedRewards(w.ctx, w.company.id), 0);
-});
-
 test('R4 duplicate_ref: the amount comes from the history ("manual:<ref>"); unconfirmed it needs an admin and is never paid again by itself', async () => {
   const w = await mworld();
   w.f.lose = 1; // the credit lands, the reply is lost

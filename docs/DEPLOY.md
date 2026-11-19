@@ -69,21 +69,21 @@ The game does nothing by itself. Retries, releases, reversals, penalty notices a
 The admin overview shows last_tick_at and raises an alert when nothing ran for over an hour.
 
 ## Moneypenny caps versus game caps
-No single credit may exceed 500 (manual_bonus_max): the game refuses such an amount when it is set up. A failed or partially granted reward is never retried by itself: check the Moneypenny ledger, then re-issue it from the admin overview (reissue, with the confirm flag).
+No single credit may exceed 500 (manual_bonus_max): the game refuses such an amount when it is set up. A failed or partly granted EVENT reward is never retried by itself. The admin page (Overview) lists it under "Rewards that need an admin": check the Moneypenny ledger first, then press Re-issue (confirm, and write what you checked, at least 10 characters). The old row is closed and a NEW grant is made, with a new reference. A period bonus (tier, streak, team) that failed, was granted only in part or was voided by the system is listed there read only: check the ledger and fix it by hand outside the app in v1.
 Rotating the Moneypenny key: calls whose answer was lost are retried under the same idempotency key; after a key rotation that key may be rejected (idempotency_conflict, shown as a provider problem). Let the queue empty (nothing 'on its way') before you rotate.
 
-Moneypenny's own default limits are: lifetime 800 credits per person, manual bonus maximum 500, 20 events per person per day. The game's defaults are higher (season cap per person 15000, event cap 1000, daily event limit 60). Where the game promises more than Moneypenny grants, Moneypenny grants only part: the row is recorded as a partial grant with the sent amount, and it is never topped up by itself. The overview names it; check the Moneypenny ledger, then re-issue the rest (reissue, with confirm) or, if the whole credit is there, mark it received (mark-received, with a ledger note). A daily or other rolling provider cap may clear within 24 hours: look at the ledger first.
+Moneypenny's own default limits are: lifetime 800 credits per person, manual bonus maximum 500, 20 events per person per day. The game's defaults are higher (season cap per person 15000, event cap 1000, daily event limit 60). Where the game promises more than Moneypenny grants, Moneypenny grants only part: an event row is recorded as a partial grant with the sent amount and is never topped up by itself; it appears under "Rewards that need an admin" (see above).
 
 ## Shop orders (not enabled in v1)
 The shop (hold, capture, release) is NOT enabled in v1: it is a v2 item (BOSS decision). The shop page says it is not available, orders answer 409 not_enabled_in_v1 and the clock does not run order steps.
 Moneypenny holds expire (about 15 minutes plus a grace). An order that is captured after that is refused for good (hold_expired): the order becomes "expired", nobody is charged, and the person orders again. Orders that cannot finish for a day are shown in the overview (open_orders_stuck).
 
 ## Environment name
-Set `ENVIRONMENT=production` in a production deployment. The test-only switch FUTURE_OPS (hold, debit, reverse, shop, buying credits) refuses to start when ENVIRONMENT or NODE_ENV starts with "prod"; without the name the guard cannot tell.
+wrangler.toml sets `ENVIRONMENT = "production"` under [vars] (functions/[[path]].js forwards it). Keep it in a production deployment. The test-only switch FUTURE_OPS (hold, debit, reverse, shop, buying credits) refuses to start when ENVIRONMENT or NODE_ENV starts with "prod"; without the name the guard cannot tell.
 
 ## Provider limits to know
-A Moneypenny tenant has a rolling 24-hour bonus cap: a credit refused with cap_reached for that reason may succeed a day later. The game does not retry a refused credit by itself in v1 (the row needs an admin): look at the ledger after 24 hours, then re-issue (with a ledger note) or mark it received.
-Key rotation: a credit whose answer was lost is retried under the same idempotency key. If the Moneypenny key is rotated in between, that key can be answered with idempotency_conflict (shown as a provider problem, retried forever, never paid twice). Empty the queue (nothing "on its way") before rotating; if it happens, check the ledger and use re-issue or mark-received.
+A Moneypenny tenant has a rolling 24-hour bonus cap: a credit refused with cap_reached for that reason may succeed a day later. The game does not retry a refused credit by itself in v1 (the row needs an admin): look at the ledger after 24 hours, then re-issue the event reward (with a ledger note); a period bonus is fixed by hand.
+Key rotation: a credit whose answer was lost is retried under the same idempotency key. If the Moneypenny key is rotated in between, that key can be answered with idempotency_conflict (shown as a provider problem, retried forever, never paid twice). Empty the queue (nothing "on its way") before rotating; if it happens, check the ledger and re-issue the event reward.
 
 ## Buying credits (not enabled in v1)
 POST /api/admin/buy (the provider's purchase page) is a v2 item: it answers 409 not_enabled_in_v1 and the admin page says it is not available. The code and its demo-provider tests stay.

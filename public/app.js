@@ -92,6 +92,7 @@
 
   // ---------- API ----------
   var REASONS = {
+    not_supported_in_v1: 'This one cannot be done in this version. Check the Moneypenny ledger and fix it by hand outside the app.', reissue_not_payable: 'It could not be queued right now (no season or no budget). Nothing was changed.', note_required: 'Please write what you checked in the ledger (at least 10 characters).', confirm_required: 'Please confirm that you checked the Moneypenny ledger.', already_covered: 'Other rewards already cover this one.', changed: 'This reward was already re-issued with another amount.',
     missing_fields: 'Please fill in person, event type, stage and reference.', bad_date: 'That date is not accepted.', unknown_person: 'We could not find that person.',
     not_allowed: 'You cannot do this one.', not_your_team: 'That person is not on your team.', outside_season: 'There is no open season for that date.',
     no_rate_card: 'No reward is set up for that event and stage.', duplicate: 'This event was already entered.', duplicate_lead: 'This looks like a repeat of an earlier lead.',
@@ -858,8 +859,37 @@
     var fn = { overview: adminOverview, settings: adminSettings, people: adminPeople, rates: adminRates, targets: adminTargets, seasons: adminSeasons, simulate: adminSimulate, content: adminContent, keys: adminKeys, shop: adminShop, ai: adminAi, run: adminRun }[sub] || adminOverview;
     return out.concat(fn());
   }
+  function needsAdminPanel() {
+    return panel('Rewards that need an admin', async function (reload) {
+      var d = await get('/api/admin/needs-admin'), who = {};
+      try { (await people()).forEach(function (p) { who[p.id] = p.name; }); } catch (e) { /* ids only */ }
+      if (!d.events.length && !d.groups.length) return empty('Nothing needs an admin.');
+      var out = [h('p', { 'class': 'muted', text: 'Check the Moneypenny ledger first. Nothing here is paid again by itself.' })];
+      if (d.events.length) {
+        out.push(h('ul', { 'class': 'list' }, d.events.map(function (x) {
+          return h('li', null, h('b', { text: who[x.person_id] || 'person ' + tail(x.person_id) }), ' ', statusChip(x.state === 'failed' ? 'failed' : 'partly sent'),
+            h('div', { 'class': 'muted small' }, cur(x.amount), x.state === 'sent' ? h('span', null, ' | sent ', cur(x.sent_amount)) : null, ' | ' + (x.reason || '') + ' | ' + when(x.created_at)),
+            h('div', { 'class': 'row' }, button('Re-issue', async function () {
+              var note = await ask({ title: 'Re-issue as a new grant?', message: 'Only after you checked the Moneypenny ledger and the old one is not there. The old row is closed and a NEW grant is made.', label: 'What did you check in the ledger?', long: true, required: true, ok: 'Re-issue' });
+              if (!note) return;
+              var r = await post('/api/admin/reissue', { id: x.id, confirm: true, note: note });
+              toast(r.warning ? r.warning : 'Re-issued as a new grant.'); reload();
+            }, 'small primary')));
+        })));
+      }
+      if (d.groups.length) {
+        out.push(h('h3', { text: 'Period bonuses (read only)' }));
+        out.push(h('ul', { 'class': 'list' }, d.groups.map(function (x) {
+          return h('li', null, h('b', { text: who[x.person_id] || 'person ' + tail(x.person_id) }), ' ', statusChip(x.state === 'void' ? 'not paid' : x.state === 'failed' ? 'failed' : 'partly sent'),
+            h('div', { 'class': 'muted small' }, cur(x.amount), ' | ' + x.kind + ' | ' + (x.reason || '') + ' | ' + when(x.created_at)),
+            h('div', { 'class': 'muted small', text: 'Needs admin, check the Moneypenny ledger. Fixed by hand outside the app in this version.' }));
+        })));
+      }
+      return h('div', null, out);
+    });
+  }
   function adminOverview() {
-    return [overviewPanel(), h('p', null, h('a', { href: '#/league', text: 'See the league' }), ' | ', h('a', { href: '#/hr', text: 'Open the HR desk' }), ' | ', h('a', { href: '#/team', text: 'Open the team view' }))];
+    return [overviewPanel(), needsAdminPanel(), h('p', null, h('a', { href: '#/league', text: 'See the league' }), ' | ', h('a', { href: '#/hr', text: 'Open the HR desk' }), ' | ', h('a', { href: '#/team', text: 'Open the team view' }))];
   }
 
   function adminSettings() {

@@ -213,6 +213,8 @@ export async function eraseLeaver(ctx, company, actor, personId) {
     ["UPDATE rights_request SET note = '' WHERE person_id = ? AND company_id = ?", p.id, company.id],
     ['UPDATE swap_offer SET help_text = NULL WHERE from_person = ? AND company_id = ?', p.id, company.id],
     aiScrub, idemScrub,
+    // the reward rows keep amounts, ids, states and the maybe_landed marker; the sealed account and any admin/ledger note are scrubbed
+    ["UPDATE reward SET note = CASE WHEN attempts > 0 THEN json_set(json_remove(COALESCE(note, '{}'), '$.acct', '$.ledger_note', '$.note', '$.inflight'), '$.maybe_landed', json('true')) ELSE json_remove(COALESCE(note, '{}'), '$.acct', '$.ledger_note', '$.note', '$.inflight') END WHERE person_id = ? AND company_id = ?", p.id, company.id],
   ]);
   return { ok: true, note: RETENTION_NOTE };
 }
