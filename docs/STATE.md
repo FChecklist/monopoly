@@ -2,7 +2,7 @@
 
 ## PAUSED (19 Nov 2026, owner order via BOSS): all resources go to Priority 1. Work resumes later.
 - Code state: commit b79d7c3 (round 28), CI green. Nothing deployed; deploy hold stands; no company live.
-- Audit state: round 28A (code reading) FAIL, one MAJOR plus minors. Round 28B (scenario/fuzz) was still running when paused; its result is NOT recorded here. Two PASSes in a row on the same exact commit are still needed.
+- Audit state: round 28A (code reading) FAIL, one MAJOR plus minors. Round 28B (scenario/fuzz) was stopped by BOSS order, unrecorded. Two PASSes in a row on the same exact commit are still needed.
 - Money safety: no overpay or double pay found in the latest rounds. Open items are free-plan limit invariants and observability.
 - ROUND 29 FIX LIST (not started):
   1. MAJOR: count rows read/written on every request (flush the counter at the end of each request in handle(); ROWS_FLUSH in src/api.js is defined but unused), including event intake, list routes, lazy tick, admin settle and season close.
