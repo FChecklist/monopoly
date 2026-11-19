@@ -222,6 +222,10 @@ export async function eraseLeaver(ctx, company, actor, personId) {
     aiScrub, idemScrub,
     // the reward rows keep amounts, ids, states and the maybe_landed marker; the sealed account and any admin/ledger note are scrubbed
     ["UPDATE reward SET note = " + SCRUB_NOTE_SQL + " WHERE person_id = ? AND company_id = ?", p.id, company.id],
+    // free text about the person in the other tables goes too (ids, amounts, states and dates stay): the event's external id (kept unique), its notes and reasons, the penalty reasons, the correction reasons
+    ["UPDATE event SET ext_id = 'erased:' || id, meta = NULL, reason = NULL, reversal_reason = NULL WHERE person_id = ? AND company_id = ?", p.id, company.id],
+    ["UPDATE penalty_case SET reason = '', decision_note = NULL WHERE person_id = ? AND company_id = ?", p.id, company.id],
+    ["UPDATE correction SET reason = '' WHERE person_id = ? AND company_id = ?", p.id, company.id],
   ]));
   return { ok: true, note: RETENTION_NOTE };
 }

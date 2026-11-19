@@ -67,6 +67,7 @@ const takeStmts = (takes, rewardId, extraWhere = '', extraParams = []) => takes.
 const replayOf = (r) => ['failed', 'void'].includes(r.state) ? { paid: 0, reason: r.state + '_before', replay: true, reward: r } : { paid: r.amount, replay: true, reward: r };
 
 export async function grant(ctx, company, p) {
+  checkIdemKey(p.idem);
   const s = settingsOf(company);
   const found = await ctx.db.first('SELECT * FROM reward WHERE idem_key = ?', p.idem);
   if (found) return ['failed', 'void'].includes(found.state) ? { paid: 0, reason: found.state + '_before', replay: true, reward: found } : { paid: found.amount, replay: true, reward: found };
@@ -629,6 +630,12 @@ async function assertPayableNow(ctx, company, want, freed = 0) {
   const funded = await one(ctx, fundedSql, company.id, season.id);
   if (funded - freed + want > season.budget) throw new ApiError(409, 'reissue_not_payable', 'The season budget has no room for this grant. Nothing was changed.');
 }
+/** An idempotency key is at most 120 characters. It is checked when it is made: a longer one is refused, never cut (a cut key could collide with another). */
+export const MAX_IDEM = 120;
+export function checkIdemKey(key) {
+  if (typeof key !== 'string' || key.length === 0 || key.length > MAX_IDEM) throw new Error('idempotency key must be 1 to ' + MAX_IDEM + ' characters (got ' + String(key).length + ')');
+  return key;
+}
 const keyAfter = (key) => { const m = /^(.*):re(\d+)$/.exec(String(key)); return m ? `${m[1]}:re${Number(m[2]) + 1}` : key + ':re1'; };
 
 /**
@@ -672,7 +679,7 @@ export async function reissueReward(ctx, company, actor, opts = {}) {
   const live = await ctx.db.first("SELECT COALESCE(SUM(amount),0) s FROM reward WHERE company_id = ? AND event_id = ? AND kind = ? AND id != ? AND state IN ('queued','sent','waiting') AND reversed = 0 AND NOT (idem_key = ? OR substr(idem_key, 1, ?) = ?)", company.id, r.event_id, r.kind, r.id, root, root.length + 3, root + ':re');
   if (live.s > 0 && live.s + delivered >= r.amount - (partial ? (n.offset ?? 0) : 0)) throw new ApiError(409, 'already_covered', 'Other rewards already cover this one: nothing to re-issue.');
   await assertPayableNow(ctx, company, want, partial ? rest : 0);
-  const newKey = keyAfter(r.idem_key);
+  let newKey; try { newKey = checkIdemKey(keyAfter(r.idem_key)); } catch { throw new ApiError(409, 'key_too_long', 'The reference of this reward cannot be extended any further: check the Moneypenny ledger and fix it by hand outside the app.'); }
   const marker = partial ? 'closed_partial' : 'reissued';
   const close = partial
     ? ["UPDATE reward SET amount = ?, last_error = 'closed_partial' WHERE id = ? AND state = 'sent' AND last_error = 'partial_grant' AND reversed = 0", (n.offset ?? 0) + delivered, r.id]

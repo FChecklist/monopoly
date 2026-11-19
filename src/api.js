@@ -13,6 +13,7 @@ import { settleCompany, simulateBudget, countFor, tiersOf } from './periods.js';
 import { ProviderError } from './provider/errors.js';
 import { shopOn, buyOn, assertBuy } from './v1.js';
 import { openOps, retryOps } from './provider-ops.js';
+import { makeBudget, budgetLimit, withBudget, BudgetReached } from './budget.js';
 
 const MAX_BODY = 1_500_000;
 
@@ -445,6 +446,8 @@ route('GET', '/api/admin/overview', async (c) => {
     open_failed_periods: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND reversed = 0 AND event_id IS NULL AND kind IN ('tier','streak','team') AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
     rewards_voided_silent: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'void' AND last_error IN ('season_closed','no_season','season_cap','person_erased') AND created_at > ? AND (event_id IS NULL OR last_error = 'person_erased')", cid, c.ctx.now() - 30 * DAY), // last 30 days; voided EVENT rewards are in the needs-admin list instead
     unconfirmed_credits: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'failed' AND last_error = 'duplicate_unconfirmed' AND reversed = 0 AND person_id IN (SELECT id FROM app_user WHERE erased_at IS NULL)", cid),
+    ...(await (async () => { const ts = await c.ctx.db.first('SELECT backlog, sweep_left, backlog_ticks, err_stage, err_at FROM tick_state WHERE company_id = ?', cid); return { tick_backlog: ts?.backlog ?? 0, tick_sweep_left: ts?.sweep_left ?? 0, tick_backlog_ticks: ts?.backlog_ticks ?? 0, tick_stage_error: ts && ts.err_at > (lastOk || 0) ? { stage: ts.err_stage, at: ts.err_at } : null }; })()),
+    recent_email_changes: await q("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'person.correct' AND at > ? AND instr(data, '\"email\"') > 0", cid, c.ctx.now() - 30 * DAY), // a changed work e-mail changes who a person is to the provider: the admin can see how many were changed lately (the audit lines name the person)
     last_tick_at: lastOk || null,
     tick_stale: (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000,
     warnings: providerCapWarnings(c.company, (await c.ctx.db.first("SELECT MAX(m) n FROM (SELECT MAX(t.bonus) m FROM tier t JOIN period_target p ON p.id = t.target_id WHERE p.company_id = ? UNION ALL SELECT MAX(bonus) FROM streak WHERE company_id = ?)", cid, cid))?.n ?? 0),
@@ -458,6 +461,8 @@ route('GET', '/api/admin/overview', async (c) => {
   // One plain line per thing that needs an admin: no code, no names.
   const say = { needs_admin: 'Some rewards need an admin: open "Rewards that need an admin" and check the Moneypenny ledger. A failed or partly granted event reward can be re-issued there as a NEW grant (after you checked the ledger); a period bonus (tier, streak, team) is fixed by hand outside the app in v1. Nothing is paid again by itself. A provider cap such as the daily one may clear within 24 hours.', open_partial_grants: 'A reward was granted only in part (the provider paid less than asked). Check the Moneypenny ledger: an event reward can be re-issued for what is missing; for a period bonus the missing part is added by hand outside the app. Nothing is topped up by itself.', open_failed_periods: 'A period bonus (tier, streak or team) failed or was only partly granted and is blocked: open "Rewards that need an admin", check the Moneypenny ledger and fix it by hand outside the app. Nothing is paid again by itself.', unconfirmed_credits: 'The provider said a credit already exists but could not confirm it. Check the Moneypenny ledger: if the credit landed, record it by hand outside the app; re-issue it only if it did NOT land.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.',   rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
+  if (o.tick_stage_error) o.alerts.push('A step of the clock failed (' + o.tick_stage_error.stage + ', ' + new Date(o.tick_stage_error.at).toISOString().slice(0, 16).replace('T', ' ') + ' UTC) and the clock has not run cleanly since: ask support to look at the audit log (tick.stage_error).');
+  if (o.tick_backlog > 0 && o.tick_backlog_ticks >= 6) o.alerts.push('The clock is behind: ' + o.tick_backlog + ' reward groups are waiting to be checked and have been for ' + o.tick_backlog_ticks + ' runs. Run the clock more often (docs/DEPLOY.md) or raise TICK_QUERY_BUDGET on a paid plan. Nothing is lost; the newest periods are checked first.');
   if (o.tick_stale) o.alerts.push('Nothing has run the clock for over an hour: set up the scheduler (docs/DEPLOY.md) or open the app regularly.');
   o.alerts.push(...o.warnings);
   return o;
@@ -468,9 +473,11 @@ route('GET', '/api/admin/rights', async (c) => { need(c.user, 'admin', 'hr'); re
  * Everything the clock drives. Run (1) by the admin button, (2) by an external scheduler calling the signed POST /api/ingest/tick (docs/DEPLOY.md), and
  * (3) lazily: any signed-in request runs a SMALL tick when none ran for 5 minutes (one winner per window, see lazyTick). Nothing else schedules it.
  */
-export async function tick(ctx, company, { limit = 100 } = {}) {
-  const r = await tickBody(ctx, company, limit);
-  await ctx.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', ctx.now(), company.id);
+export async function tick(ctx, company, { limit = 100, only = null } = {}) {
+  const r = await tickBody(ctx, company, limit, only);
+  // The clock only counts as fully run when no stage failed. A stage that stopped because the per-tick budget ran out is not a failure (its backlog is shown in the overview).
+  if (!r._errors) await ctx.db.run('UPDATE company SET last_tick_ok_at = ? WHERE id = ?', ctx.now(), company.id);
+  delete r._errors;
   return r;
 }
 const LAZY_EVERY = 5 * 60_000;
@@ -483,22 +490,52 @@ export async function lazyTick(ctx, company) {
   try { await tick(ctx, company, { limit: 25 }); } catch (e) { console.error('lazy tick failed', e?.message); }
   return true;
 }
-async function tickBody(ctx, company, limit) {
-  // Every stage runs on its own: one that throws is recorded (one audit line per stage per day) and never stops the others.
+// The stages of the clock. With a query budget (TICK_QUERY_BUDGET, default 40: one worker invocation on a free D1 plan allows about 50) a tick runs ONE of two turns, so every stage
+// can use a useful share: the core turn (sending, releasing, resuming, reversals, penalties, AI housekeeping) and the settle turn. They alternate; a tick with no budget (0) runs everything.
+const CORE = ['sent', 'released', 'resumed', 'reversals', 'penalties', 'orders', 'ai_resumed', 'purged'];
+const RESERVE = 3; // queries kept for the bookkeeping at the end of a bounded tick
+async function tickBody(ctx, company, limit, only = null) {
+  const limitQ = budgetLimit(ctx.env), bounded = limitQ > 0;
+  const b = makeBudget(limitQ), t = bounded ? withBudget(ctx, b) : ctx;
+  const defs = {
+    sent: () => R.retryQueued(t, company, limit), released: () => R.releaseWaiting(t, company), resumed: () => E.resumeApproved(t, company),
+    reversals: () => E.processReversals(t, company), penalties: () => Pen.tickPenalties(t, company), settled: () => settleCompany(t, company, ctx.now()),
+    orders: () => S.finishOrders(t, company), ai_resumed: () => AI.resumeAiRuns(t, company), purged: () => AI.purgeAiData(t, company),
+  };
+  let st = null, seq = 0;
+  if (bounded) { st = await t.db.first('SELECT * FROM tick_state WHERE company_id = ?', company.id).catch(() => null); seq = st?.tick_seq ?? 0; }
+  const names = only ?? (bounded ? (seq % 2 === 0 ? CORE : ['settled']) : [...CORE.slice(0, 5), 'settled', ...CORE.slice(5)]);
   const out = {};
-  const stages = [
-    ['sent', () => R.retryQueued(ctx, company, limit)], ['released', () => R.releaseWaiting(ctx, company)], ['resumed', () => E.resumeApproved(ctx, company)],
-    ['reversals', () => E.processReversals(ctx, company)], ['penalties', () => Pen.tickPenalties(ctx, company)], ['settled', () => settleCompany(ctx, company, ctx.now())],
-    ['orders', () => S.finishOrders(ctx, company)], ['ai_resumed', () => AI.resumeAiRuns(ctx, company)], ['purged', () => AI.purgeAiData(ctx, company)],
-  ];
-  for (const [name, fn] of stages) {
-    try { out[name] = await fn(); } catch (e) {
-      out[name] = { error: e?.code ?? 'internal' };
+  let errored = 0, errStage = null, budgetHit = false;
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    if (bounded) { b.cap = Math.max(b.used + 2, limitQ - RESERVE - 2 * (names.length - 1 - i)); b.hit = 0; } // a later stage always keeps a little
+    try { out[name] = await defs[name](); } catch (e) {
+      if (e instanceof BudgetReached) { out[name] = { budget: true }; budgetHit = true; continue; }
+      out[name] = { error: e?.code ?? 'internal' }; errored++; errStage = errStage ?? name;
       try {
-        if (!(await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.stage_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, '"stage":"' + name + '"'))) await commit(ctx, company.id, 'system', 'tick.stage_error', { stage: name, code: String(e?.code ?? 'internal').slice(0, 40) });
+        b.cap = limitQ || Infinity;
+        if (!(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.stage_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, '"stage":"' + name + '"'))) await commit(t, company.id, 'system', 'tick.stage_error', { stage: name, code: String(e?.code ?? 'internal').slice(0, 40) });
       } catch { /* the next tick writes it */ }
     }
+    if (bounded && b.hit > 0) { budgetHit = true; if (out[name] && typeof out[name] === 'object') out[name] = { ...out[name], budget: true }; }
   }
+  if (bounded) { // bookkeeping: cursor, backlog, the last stage error, one 'budget reached' line a day
+    try {
+      b.cap = limitQ; b.hit = 0;
+      const ranSettle = names.includes('settled') && !out.settled?.error;
+      const backlog = ranSettle ? (b.backlog ?? 0) : (st?.backlog ?? 0);
+      if (ranSettle && backlog > 0) budgetHit = true; // groups were left for the next tick: the budget (not an error) is why
+      const bt = ranSettle ? (backlog > 0 ? (st?.backlog_ticks ?? 0) + 1 : 0) : (st?.backlog_ticks ?? 0);
+      const cursor = ranSettle ? (b.settleCursorSet ? (b.settleCursor ?? null) : (st?.settle_cursor ?? null)) : (st?.settle_cursor ?? null);
+      await t.db.run('INSERT INTO tick_state (company_id, tick_seq, settle_cursor, backlog, sweep_left, backlog_ticks, budget_at, err_stage, err_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (company_id) DO UPDATE SET tick_seq = excluded.tick_seq, settle_cursor = excluded.settle_cursor, backlog = excluded.backlog, sweep_left = excluded.sweep_left, backlog_ticks = excluded.backlog_ticks, budget_at = excluded.budget_at, err_stage = excluded.err_stage, err_at = excluded.err_at',
+        company.id, seq + 1, cursor, backlog, ranSettle ? (b.sweepLeft ?? 0) : (st?.sweep_left ?? 0), bt, budgetHit ? ctx.now() : (st?.budget_at ?? 0), errored ? errStage : (st?.err_stage ?? null), errored ? ctx.now() : (st?.err_at ?? 0));
+      if (budgetHit && !(await t.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.budget_reached' AND at > ?", company.id, ctx.now() - DAY))) await commit(t, company.id, 'system', 'tick.budget_reached', { budget: limitQ, backlog });
+    } catch { /* the next tick */ }
+  } else if (errored) {
+    try { await ctx.db.run('INSERT INTO tick_state (company_id, err_stage, err_at) VALUES (?,?,?) ON CONFLICT (company_id) DO UPDATE SET err_stage = excluded.err_stage, err_at = excluded.err_at', company.id, errStage, ctx.now()); } catch { /* the next tick */ }
+  }
+  out._errors = errored;
   return out;
 }
 

@@ -7,6 +7,8 @@ import { grant, reverseReward, seasonAt, healPendingReverses, groupBlocker, mark
 import { periodOf, prevPeriod, DAY, sha256Hex, newId, monthKey, dayKey } from './util.js';
 import { commit } from './audit.js';
 import { ProviderError } from './provider/errors.js';
+import { settleBounded } from './settle_bounded.js';
+import { BudgetReached } from './budget.js';
 
 const COUNT = "('queued','sent','waiting','recorded')";
 
@@ -107,13 +109,15 @@ async function settleOnce(ctx, company, { person, kind, groupKey, periodKey, ent
     const owedNow = left;
     const n = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%'", company.id, person.id, groupKey)).n;
     const reason = 'tier_lost:' + (label ?? kind);
-    const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`, cid = newId('cr'); // the correction id rides in the delta row's note: a later rise nets against exactly this correction
+    const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`, cid = newId('cr'), dnId = newId('rw'); // the correction id rides in the delta row's note: a later rise nets against exactly this correction
     try {
-      await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: owedNow, entitled, delta: true }, [
-        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0)",
-          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason, delta: true, owed: owedNow, cut: d - owedNow, cid: owedNow > 0 ? cid : null }), ctx.now()],
-        ...(owedNow > 0 ? [["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", cid, company.id, person.id, owedNow, reason, ctx.now()]] : []),
-      ]);
+      // Guarded like the cash and net rows: the drop is booked only while the group's counted total is still the figure it was computed from, so two drops at once cannot book two corrections.
+      const res = await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: owedNow, entitled, delta: true }, [
+        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) SELECT ?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0 WHERE (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN " + COUNT + ") = ?",
+          dnId, company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason, delta: true, owed: owedNow, cut: d - owedNow, cid: owedNow > 0 ? cid : null }), ctx.now(), company.id, person.id, groupKey, paid],
+        ...(owedNow > 0 ? [["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) SELECT ?,?,?,?, 'open', ?, NULL, ? WHERE EXISTS (SELECT 1 FROM reward WHERE id = ?)", cid, company.id, person.id, owedNow, reason, ctx.now(), dnId]] : []),
+      ], { onlyIf: { sql: 'SELECT 1 FROM reward WHERE id = ?', params: [dnId] } });
+      if (res[0].changes === 0) { out.stale = true; return out; } // the group moved under us: read it again
       out.owed = owedNow;
     } catch (e) { if (!/idem_key/i.test(String(e?.message))) throw e; } // another settle run did the same delta
   }
@@ -214,7 +218,7 @@ async function blockedAt(ctx, company, key) {
  * A reversal entry (entitled below what was paid) is NEVER blocked: it is retried at every close. A config or provider-state error
  * (unsupported, unauthorized, misconfigured, rate limit, timeout...) never writes a block. A changed entitlement is a new key.
  */
-async function safeSettle(ctx, company, report, args) {
+export async function safeSettle(ctx, company, report, args) {
   if (args.person?.erased_at) return { paid: 0, reversed: 0 }; // an erased leaver is never paid or settled again
   const key = await keyOf(args);
   const isReversal = args.entitled < (await paidSum(ctx, company.id, args.person.id, args.groupKey));
@@ -235,6 +239,7 @@ async function safeSettle(ctx, company, report, args) {
     if (at !== null) { await commit(ctx, company.id, 'system', 'period.settle_unblocked', { key, kind: args.kind }); report.unblocked = (report.unblocked ?? 0) + 1; }
     return out;
   } catch (e) {
+    if (e instanceof BudgetReached) throw e; // the tick ran out of queries: stop cleanly, this group is visited again next tick
     if (!(e instanceof ProviderError)) { // whatever failed, one entry never stops the close
       report.errors = (report.errors ?? 0) + 1;
       try { await logSettleError(ctx, company, { kind: args.kind, group: args.groupKey, code: 'internal' }); } catch { /* the next close logs again */ }
@@ -292,7 +297,7 @@ const weightOf = (u, p) => {
   return Math.max(0.0001, Math.min(1, Math.max(0, to - from) / (p.end - p.start)));
 };
 
-async function snapshotTeam(ctx, company, t, pr, team) {
+export async function snapshotTeam(ctx, company, t, pr, team) {
   const key = [t.id, pr.key, team.id];
   if (!(await ctx.db.first('SELECT 1 x FROM team_period WHERE target_id=? AND period_key=? AND team_id=?', ...key))) {
     const stmts = [['INSERT OR IGNORE INTO team_period (target_id, period_key, team_id, company_id, closed_at) VALUES (?,?,?,?,?)', ...key, company.id, ctx.now()]];
@@ -309,7 +314,7 @@ async function snapshotTeam(ctx, company, t, pr, team) {
  * paid again by the new team nor does their share vanish from the pool. A person is in one team's list per period.
  * Later runs may only LOWER a share (events reversed after the close), never raise it, and never add members.
  */
-async function teamEntitlements(ctx, company, t, tiers, pr, team, s, final) {
+export async function teamEntitlements(ctx, company, t, tiers, pr, team, s, final) {
   const key = [t.id, pr.key, team.id];
   await snapshotTeam(ctx, company, t, pr, team);
   const rows = await ctx.db.all('SELECT m.*, u.id uid FROM team_period_member m JOIN app_user u ON u.id = m.person_id WHERE m.target_id=? AND m.period_key=? AND m.team_id=? ORDER BY m.person_id', ...key);
@@ -341,6 +346,7 @@ async function teamEntitlements(ctx, company, t, tiers, pr, team, s, final) {
  * Periods that ended before the target's active_from are never settled (adding a target later pays nothing for the past).
  */
 export async function settleCompany(ctx, company, asOf = ctx.now(), { force = false } = {}) {
+  if (ctx.budget && !ctx.budget.unlimited && !force) return settleBounded(ctx, company, asOf); // the clock runs under a per-tick query budget: cursor, fingerprints, backlog (src/settle_bounded.js)
   const s = settingsOf(company);
   const report = { tiers: 0, paid: 0, reversed: 0, streaks: 0, team: 0 };
   const lag = force ? 0 : s.late_close_days * DAY;

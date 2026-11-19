@@ -5,7 +5,7 @@ import { createCompany, addPerson } from '../src/people.js';
 import { createTeam } from '../src/setup.js';
 import * as setup from '../src/setup.js';
 
-export const ENV = { SEAL_KEY: 'test-seal-key-0123456789abcdef-0123456789', MASTER_SECRET: 'test-master-secret-0123456789abcdef-0123456789', ALLOW_DEMO_PROVIDER: '1', FUTURE_OPS: '1', LAZY_TICK: '0' }; // FUTURE_OPS: the test-only switch for the abilities that are NOT ENABLED in v1 (hold, debit, reverse); world({ v1: true }) runs without it
+export const ENV = { SEAL_KEY: 'test-seal-key-0123456789abcdef-0123456789', MASTER_SECRET: 'test-master-secret-0123456789abcdef-0123456789', ALLOW_DEMO_PROVIDER: '1', FUTURE_OPS: '1', LAZY_TICK: '0', TICK_QUERY_BUDGET: '0' }; // FUTURE_OPS: the test-only switch for the abilities that are NOT ENABLED in v1 (hold, debit, reverse); world({ v1: true }) runs without it
 export const T0 = Date.parse('2026-11-02T10:00:00+05:30'); // a Monday
 
 export async function world({ v1 = false, providerOverride = null, budget = 1_000_000, mode = 'steady', settings = {} } = {}) {

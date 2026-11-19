@@ -20,7 +20,7 @@ Do the steps in order and tick them off. Write each id you receive into the roll
 1. `npx wrangler d1 create <database-name>` (use the name in `wrangler.toml`). Copy the printed database id into `wrangler.toml` `database_id`.
 2. Apply the migrations IN ORDER, lowest number first, each exactly once:
    `npx wrangler d1 migrations apply <database-name> --remote`
-   (the files are in `migrations/`, `0001_...` then `0002_...` and so on up to `0008_idx.sql` (an index only, safe to re-run); apply only that folder to D1).
+   (the files are in `migrations/`, `0001_...` then `0002_...` and so on up to `0009_tick_budget.sql` (new tables tick_state and settle_mark; `0008_idx.sql` is an index only, safe to re-run); apply only that folder to D1).
 3. Check: `npx wrangler d1 execute <database-name> --remote --command "SELECT name FROM sqlite_master WHERE type='table'"` lists the tables and none is a balance table.
 4. Record the time of the first good backup point (see ROLLBACK.md, time travel).
 
@@ -67,6 +67,8 @@ The game does nothing by itself. Retries, releases, reversals, penalty notices a
    - GitHub Actions: copy docs/templates/tick-workflow.yml to .github/workflows/ (it is NOT active where it is). It needs two repository secrets the owner adds (TICK_KEY_ID, TICK_SECRET) and one variable (TICK_URL). No secret is stored in the repo.
 3. The admin button (POST /api/admin/tick).
 The admin overview shows last_tick_at and raises an alert when nothing ran for over an hour.
+
+Query budget: one tick is one worker invocation. A free D1 plan allows about 50 queries per invocation (1,000 on a paid plan: check the current Cloudflare limits page), so the tick counts its queries and provider calls and stops cleanly at TICK_QUERY_BUDGET (default 40; 0 = no limit; about 800 on a paid plan). The next tick carries on (newest periods first). The overview shows tick_backlog and alerts when the clock stays behind for 6 runs, and shows tick_stage_error when a step of the clock failed; run the clock every 5 minutes and read those two fields. Set TICK_QUERY_BUDGET as a Pages variable (it is forwarded to the app).
 
 ## Moneypenny caps versus game caps
 No single credit may exceed 500 (manual_bonus_max): the game refuses such an amount when it is set up. A failed or partly granted EVENT reward is never retried by itself. The admin page (Overview) lists it under "Rewards that need an admin": check the Moneypenny ledger first, then press Re-issue (confirm, and write what you checked, at least 10 characters). The old row is closed and a NEW grant is made, with a new reference. A period bonus (tier, streak, team) that failed, was granted only in part or was voided by the system is listed there read only: check the ledger and fix it by hand outside the app in v1.
