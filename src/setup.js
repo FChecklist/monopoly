@@ -95,8 +95,12 @@ export async function publishSeason(ctx, company, actor, seasonId, { allowStarte
   const prov = ctx.provider(company);
   if ((await prov.capabilities()).hold) {
     const topUp = s.mode === 'dice' ? Math.ceil(s.budget * (1 + st.bonus_max_pct / 100)) : s.budget; // the whole range is funded in advance
-    const h = await prov.reserveBudget({ amount: topUp, name: s.name, idem: 'hold:' + s.id });
+    const n = (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'season.hold_intent' AND instr(data, ?) > 0", company.id, `"id":"${s.id}"`)).n;
+    const key = n ? `hold:${s.id}:n${n}` : 'hold:' + s.id;
+    await commit(ctx, company.id, actor.id, 'season.hold_intent', { id: s.id, key, amount: topUp }); // before the call: a lost answer is found and released by the tick
+    const h = await prov.reserveBudget({ amount: topUp, name: s.name, idem: key });
     hold = h.hold_id;
+    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold, key });
   }
   await commit(ctx, company.id, actor.id, 'season.publish', { id: s.id, hold }, [["UPDATE season SET status='published', published_at=?, hold_id=? WHERE id=? AND status='draft'", ctx.now(), hold, s.id]]);
   return { id: s.id, hold_id: hold };
@@ -112,17 +116,26 @@ export async function raiseBudget(ctx, company, actor, seasonId, budget) {
   if (s.hold_id && (await prov.capabilities()).hold) {
     // The new budget is held in full (less what was already paid out); the old hold's remainder goes back.
     const st = settingsOf(company);
-    // Only SENT rows have drawn from the hold. A queued row has not (it draws when it is sent), so it stays inside the new hold or it would draw twice.
+    // Only SENT rows have drawn from the hold. A queued row that was tried may or may not have landed (a lost reply looks like an outage): it is NOT counted as drawn, because under-reserving would strand it as 'waiting' for ever, while over-reserving by its amount is returned when the season closes.
     const used = (await ctx.db.first("SELECT COALESCE(SUM(sent_amount),0) n FROM reward WHERE company_id=? AND season_id=? AND amount>0 AND state='sent'", company.id, s.id)).n;
     const top = s.mode === 'dice' ? Math.ceil(budget * (1 + st.bonus_max_pct / 100)) : budget;
-    const h = await prov.reserveBudget({ amount: Math.max(0, top - used), name: s.name, idem: `hold:${s.id}:${budget}:u${used}` }); // the key carries what was used: a replay is never sized by an older number
+    const amount = Math.max(0, top - used);
+    const key = await holdKey(ctx, company, s.id, `${budget}:u${used}`);
+    // The intent is written BEFORE the call: a lost answer leaves a line the tick can replay (same key) to find the hold and give it back.
+    await commit(ctx, company.id, actor.id, 'season.hold_intent', { id: s.id, key, amount });
+    const h = await prov.reserveBudget({ amount, name: s.name, idem: key });
     holdId = h.hold_id;
-    // Recorded BEFORE the season row changes: if the commit below fails and the admin retries (maybe at another budget), this hold is found and released by the tick.
-    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold: holdId });
+    await commit(ctx, company.id, actor.id, 'season.hold_new', { id: s.id, hold: holdId, key });
   }
-  // The new hold is recorded FIRST; only then the old one goes back. A failed commit can never leave the season on a released hold.
-  await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId, old: holdId !== s.hold_id ? s.hold_id : null }, [['UPDATE season SET budget = ?, hold_id = ? WHERE id = ?', budget, holdId, s.id]]); // 'old' = the hold that must go back; the tick keeps trying until it has
-  await releasePendingHolds(ctx, company);
+  // The new hold is recorded FIRST; only then the old one goes back. The row only moves UP (a concurrent raise can never be lowered by this one).
+  const res = await commit(ctx, company.id, actor.id, 'season.budget', { id: s.id, from: s.budget, to: budget, hold: holdId, old: holdId !== s.hold_id ? s.hold_id : null }, [["UPDATE season SET budget = ?, hold_id = ? WHERE id = ? AND status = 'published' AND budget <= ?", budget, holdId, s.id, budget]], { onlyIfChanged: true }); // 'old' = the hold that must go back; the tick keeps trying until it has
+  if (res[res.length - 1].changes === 0) throw new ApiError(409, 'budget_changed', 'The budget changed while you were saving. Nothing was changed; the unused hold goes back.');
+  try { await releasePendingHolds(ctx, company); } catch { /* the tick does it */ }
+}
+/** A hold key is never reused: every reserve attempt of a season has its own number, so a released hold is never replayed. */
+async function holdKey(ctx, company, seasonId, what) {
+  const n = (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'season.hold_intent' AND instr(data, ?) > 0", company.id, `"id":"${seasonId}"`)).n;
+  return `hold:${seasonId}:${what}:n${n}`;
 }
 export async function closeSeason(ctx, company, actor, seasonId) {
   must(actor, 'admin');
@@ -138,7 +151,7 @@ export async function closeSeason(ctx, company, actor, seasonId) {
   else if (s.hold_id && (await prov.capabilities()).hold) needRelease = true;
   // The close is recorded FIRST (deferred while a hold still has to go back); the hold is released after, so a failed commit cannot leave a published season on a released hold.
   await commit(ctx, company.id, actor.id, 'season.close', deferred || needRelease ? { id: s.id, released, deferred: true } : { id: s.id, released }, [["UPDATE season SET status='closed' WHERE id=?", s.id]]);
-  if (needRelease) { const amt = await releaseSeasonHold(ctx, company, s); if (amt === null) deferred = true; else released = amt; } // unused budget goes back to the company
+  if (needRelease) { const cur = await ctx.db.first('SELECT * FROM season WHERE id=?', s.id); const amt = await releaseSeasonHold(ctx, company, cur?.hold_id ? cur : s); if (amt === null) deferred = true; else released = amt; } // unused budget goes back to the company
   return deferred ? { released, hold_pending: true } : { released };
 }
 
@@ -230,9 +243,14 @@ export async function decideOrder(ctx, company, actor, orderId, accept) {
   must(actor, 'admin', 'hr');
   const o = await ctx.db.first("SELECT * FROM catalogue_order WHERE id = ? AND company_id = ? AND state = 'reserved'", orderId, company.id);
   if (!o) throw new ApiError(404, 'no_order', 'No order waiting.');
-  const prov = ctx.provider(company);
-  if (accept) await prov.captureSpend({ holdId: o.hold_id, idem: 'cap:' + o.id }); else await prov.releaseSpend({ holdId: o.hold_id, idem: 'rel:' + o.id });
   const state = accept ? 'captured' : 'released';
-  await commit(ctx, company.id, actor.id, 'order.' + state, { id: o.id }, [["UPDATE catalogue_order SET state = ? WHERE id = ? AND state = 'reserved'", state, o.id]]);
+  // Claim FIRST: of two overlapping decisions only one changes the row and calls the provider.
+  const claim = await ctx.db.run("UPDATE catalogue_order SET state = ? WHERE id = ? AND state = 'reserved'", state, o.id);
+  if (claim.changes === 0) throw new ApiError(409, 'already_decided', 'This order was already decided.');
+  try {
+    const prov = ctx.provider(company);
+    if (accept) await prov.captureSpend({ holdId: o.hold_id, idem: 'cap:' + o.id }); else await prov.releaseSpend({ holdId: o.hold_id, idem: 'rel:' + o.id });
+  } catch (e) { await ctx.db.run("UPDATE catalogue_order SET state = 'reserved' WHERE id = ? AND state = ?", o.id, state); throw e; }
+  await commit(ctx, company.id, actor.id, 'order.' + state, { id: o.id });
   return { id: o.id, state };
 }

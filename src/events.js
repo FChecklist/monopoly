@@ -182,6 +182,7 @@ export async function applyEvent(ctx, company, eventId) {
       // Only the system's own two-approver rule (backdated or big) lifts the per-event cap, never a typed-in min_approvals.
       capEvent: meta.rule2 ? 0 : capOf(s, 'cap_event'), reserve: top, actor: 'system', // a 0 or junk cap_event falls back to the default; only the system's two-approver rule lifts it
     });
+    if (g.reason === 'busy') return null; // not decided yet: the event stays 'approved' and the tick runs it again
     out.paid = g.paid;
     if (dice && g.paid > 0) {
       // Bonus roll: the base is already decided. The die only sizes a bonus on top, inside [floor, max], at least 1 credit.
@@ -189,6 +190,7 @@ export async function applyEvent(ctx, company, eventId) {
       const pct = bonusPct(s.bonus_floor_pct, s.bonus_max_pct, d);
       const bonus = Math.min(top, Math.max(1, Math.floor((g.paid * pct) / 100)));
       const b = await grant(ctx, company, { person, kind: 'bonus_roll', amount: bonus, idem: `bonus:${ev.id}:${ev.stage}`, groupKey: `bonus:${ev.event_type}:${ev.stage}`, at: ev.occurred_at, eventId: ev.id, card, actor: 'system' });
+      if (b.reason === 'busy') return null;
       out.bonus = b.paid; out.roll = { die: d, pct };
     }
   }

@@ -48,7 +48,7 @@ export class StubProvider {
     const h = await this.db.first('SELECT * FROM stub_hold WHERE id = ? AND tenant = ?', holdId, this.tenant);
     if (!h) throw new ProviderError('hold_expired', 'No such hold.');
     const rel = Math.min(h.remaining, amount ?? h.remaining);
-    await this.db.run('UPDATE stub_hold SET remaining = remaining - ? WHERE id = ?', rel, holdId);
+    await this.db.run('UPDATE stub_hold SET remaining = MAX(0, remaining - ?) WHERE id = ?', rel, holdId);
     return { remaining: h.remaining - rel, released: rel };
   }
   async credit({ accountRef, amount, fromHoldId, reasonCode, ref, idem }) {

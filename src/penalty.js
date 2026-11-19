@@ -154,7 +154,7 @@ async function applyPenalty(ctx, company, c0) {
         } catch (e) {
           if (!(e instanceof ProviderError)) throw e;
           const transient = e.retriable || (isTransient(e.code) && e.code !== 'unsupported' && e.code !== 'insufficient_credits');
-          if (pend && !transient) { // an earlier try may have landed: a definitive 'no' now is not believed, the case stays pending (retried up to MAX_DEBIT_TRIES, then shown as open_debits_failed)
+          if ((pend || (await markerCount(ctx, company, dkey)) > 1) && !transient) { // an earlier try may have landed: a definitive 'no' now is not believed, the case stays pending (retried up to MAX_DEBIT_TRIES, then shown as open_debits_failed)
             if ((await debitTries(ctx, company, dkey)) < MAX_DEBIT_TRIES) { try { await commit(ctx, company.id, 'system', 'penalty.debit_failed', { id: c.id, key: dkey, code: e.code }); } catch { /* counted next time */ } }
             return null;
           }
@@ -190,6 +190,7 @@ async function pendingDebit(ctx, company, key) {
   try { return JSON.parse(m.data); } catch { return null; }
 }
 const MAX_DEBIT_TRIES = 5;
+const markerCount = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.debit_pending' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n; // re-read: an overlapping tick may have announced it meanwhile
 const debitTries = async (ctx, company, key) => (await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.debit_failed' AND instr(data, ?) > 0", company.id, `"key":"${key}"`)).n;
 /** Debits that stopped retrying (admin overview: open_debits_failed). */
 export async function openDebitsFailed(ctx, companyId) {
@@ -216,12 +217,19 @@ async function finishDebits(ctx, company) {
     if (['proposed', 'pending', 'appealed', 'upheld'].includes(c.state)) continue; // will still be applied: that replays the marker
     const rk = 'penrestore:' + d.id + (d.gen ? ':g' + d.gen : '');
     if ((await ctx.db.first("SELECT COUNT(*) n FROM audit WHERE company_id = ? AND action = 'penalty.restore' AND instr(data, ?) > 0", company.id, `"key":"${rk}"`)).n > 0) { await resolveDebit(ctx, company, d.id, d.key); continue; }
+    if ((await debitTries(ctx, company, d.key)) >= MAX_DEBIT_TRIES) continue; // gave up: open_debits_failed
     let took = 0;
     try {
       const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', c.person_id);
       const prov = ctx.provider(company);
       if ((await prov.capabilities()).debit) took = (await prov.debit({ accountRef: await accountRef(ctx, company, person), amount: d.ask, reasonCode: 'penalty', ref: d.id, idem: d.key, monthlyCap: d.room })).debited ?? 0;
-    } catch (e) { if (!(e instanceof ProviderError)) throw e; if (e.retriable || isTransient(e.code)) continue; }
+    } catch (e) {
+      if (!(e instanceof ProviderError)) throw e;
+      if (e.retriable || (isTransient(e.code) && e.code !== 'unsupported' && e.code !== 'insufficient_credits')) continue;
+      // A definitive "no" to a replay of a debit that may have landed is not believed: it stays pending (up to MAX_DEBIT_TRIES, then open_debits_failed).
+      if ((await debitTries(ctx, company, d.key)) < MAX_DEBIT_TRIES) { try { await commit(ctx, company.id, 'system', 'penalty.debit_failed', { id: d.id, key: d.key, code: e.code }); } catch { /* counted next time */ } }
+      continue;
+    }
     if (took > 0) await restoreDebit(ctx, company, d.id, took, d.gen ?? 0);
     await resolveDebit(ctx, company, d.id, d.key); n++;
   }

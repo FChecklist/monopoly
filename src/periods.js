@@ -83,6 +83,12 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   return out;
 }
 
+/** One 'period.settle_error' line per (group, code) until the code changes: a stuck entry must not grow the audit chain at every tick. */
+async function logSettleError(ctx, company, data) {
+  const last = await ctx.db.first("SELECT data FROM audit WHERE company_id = ? AND action = 'period.settle_error' AND instr(data, ?) > 0 ORDER BY n DESC LIMIT 1", company.id, `"group":"${data.group}"`);
+  try { if (last && JSON.parse(last.data).code === data.code) return; } catch { /* write it */ }
+  await commit(ctx, company.id, 'system', 'period.settle_error', data);
+}
 const BLOCK_TTL = 24 * 3600_000; // a block expires: the entry is tried again after a day
 const BLOCKING_CODES = new Set(['account_closed', 'bad_request']); // account-specific and permanent; configuration/provider-state errors are never recorded as a block
 const MARKERS = "('period.settle_blocked','period.settle_unblocked')";
@@ -107,7 +113,7 @@ async function safeSettle(ctx, company, report, args) {
   if (!isReversal && at !== null && ctx.now() - at < BLOCK_TTL) { report.blocked = (report.blocked ?? 0) + 1; return { paid: 0, reversed: 0 }; }
   try {
     const out = await settleEntitlement(ctx, company, args);
-    if (out.skipped) { report.reversal_skipped = (report.reversal_skipped ?? 0) + out.skipped; await commit(ctx, company.id, 'system', 'period.settle_error', { kind: args.kind, group: args.groupKey, code: 'reverse_pending_' + out.skipCode }); }
+    if (out.skipped) { report.reversal_skipped = (report.reversal_skipped ?? 0) + out.skipped; await logSettleError(ctx, company, { kind: args.kind, group: args.groupKey, code: 'reverse_pending_' + out.skipCode }); }
     if (out.kept) {
       report.reversal_kept = (report.reversal_kept ?? 0) + out.kept; report.reversal_kept_amount = (report.reversal_kept_amount ?? 0) + (out.keptAmount ?? 0);
       // The person stays overpaid on purpose: one audit line per key (ids, codes and the amount only).
@@ -122,7 +128,7 @@ async function safeSettle(ctx, company, report, args) {
   } catch (e) {
     if (!(e instanceof ProviderError)) { // whatever failed, one entry never stops the close
       report.errors = (report.errors ?? 0) + 1;
-      try { await commit(ctx, company.id, 'system', 'period.settle_error', { kind: args.kind, group: args.groupKey, code: 'internal' }); } catch { /* the next close logs again */ }
+      try { await logSettleError(ctx, company, { kind: args.kind, group: args.groupKey, code: 'internal' }); } catch { /* the next close logs again */ }
       return { paid: 0, reversed: 0 };
     }
     const code = e.code ?? 'error';
@@ -130,7 +136,7 @@ async function safeSettle(ctx, company, report, args) {
     if (!isReversal && !e.retriable && BLOCKING_CODES.has(code)) {
       await commit(ctx, company.id, 'system', 'period.settle_blocked', { key, kind: args.kind, code });
       report.blocked = (report.blocked ?? 0) + 1; report.newly_blocked = (report.newly_blocked ?? 0) + 1;
-    } else await commit(ctx, company.id, 'system', 'period.settle_error', { kind: args.kind, group: args.groupKey, code });
+    } else await logSettleError(ctx, company, { kind: args.kind, group: args.groupKey, code });
     return { paid: 0, reversed: 0 };
   }
 }

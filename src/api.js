@@ -427,6 +427,7 @@ route('GET', '/api/admin/overview', async (c) => {
     open_failed_rewards: await R.openFailedRewards(c.ctx, cid),
     open_restores_failed: await Pen.openRestoresFailed(c.ctx, cid),
     open_debits_failed: await Pen.openDebitsFailed(c.ctx, cid),
+    open_reverses_failed: await R.openReversesFailed(c.ctx, cid),
     rewards_stuck: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
     rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
@@ -434,7 +435,7 @@ route('GET', '/api/admin/overview', async (c) => {
     used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
   };
   // One plain line per thing that needs an admin: no code, no names.
-  const say = { open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
+  const say = { open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
   return o;
 });
