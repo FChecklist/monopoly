@@ -42,6 +42,12 @@ export async function periodsHit(ctx, company, target, personId, asOf) {
 const paidSum = async (ctx, companyId, personId, groupKey) =>
   (await ctx.db.first(`SELECT COALESCE(SUM(amount),0) s FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}`, companyId, personId, groupKey)).s;
 
+/** A failed period row is retried under a new key three times a day apart, then once a week (it is never given up; revive-failed does it at once). */
+async function quickRetryDue(ctx, company, person, groupKey) {
+  const f = await ctx.db.first("SELECT COUNT(*) n, MAX(created_at) m FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed'", company.id, person.id, groupKey);
+  return f.n < 3 || ctx.now() - (f.m ?? 0) >= 7 * DAY;
+}
+
 /** Bring what was paid for (person, group) in line with what is earned now. */
 export async function settleEntitlement(ctx, company, { person, kind, groupKey, periodKey, entitled, at, label }) {
   const healed = await healPendingReverses(ctx, company, person.id, groupKey); // a reverse whose answer was lost is finished first (same key): paid is only trusted after that
@@ -71,22 +77,35 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   }
   if (!canReverse && entitled < paid) {
     const d = paid - entitled;
+    // Rows granted only in part have a remainder that was never delivered: a drop is taken from that remainder first (it is cut, nothing is owed for it); only the rest is owed. A top-up in flight waits.
+    const parts = await ctx.db.all("SELECT id, note, amount, sent_amount FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='sent' AND reversed=0 AND last_error='partial_grant' ORDER BY created_at DESC, rowid DESC", company.id, person.id, groupKey);
+    let left = d;
+    for (const pr of parts) {
+      const pn = JSON.parse(pr.note || '{}');
+      if (pn.inflight) { out.skipped = (out.skipped ?? 0) + 1; out.skipCode = 'topup_pending'; return out; }
+      const cut = Math.min(Math.max(0, pr.amount - (pn.offset ?? 0) - (pn.remCut ?? 0) - pr.sent_amount), left);
+      if (cut <= 0) continue;
+      const up = await ctx.db.run("UPDATE reward SET note = ? WHERE id = ? AND note IS ?", JSON.stringify({ ...pn, remCut: (pn.remCut ?? 0) + cut }), pr.id, pr.note);
+      if (up.changes === 0) { out.skipped = (out.skipped ?? 0) + 1; out.skipCode = 'topup_pending'; return out; } // a top-up changed the row meanwhile: decide next close
+      left -= cut;
+    }
+    const owedNow = left;
     const n = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%'", company.id, person.id, groupKey)).n;
     const reason = 'tier_lost:' + (label ?? kind);
     const idem = `dn:${person.id}:${groupKey}:n${n}:e${entitled}:p${paid}`;
     try {
-      await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: d, entitled, delta: true }, [
-        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,NULL,NULL,'recorded',?,?,0)",
-          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), JSON.stringify({ reason, delta: true, owed: d }), ctx.now()],
-        ["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", newId('cr'), company.id, person.id, d, reason, ctx.now()],
+      await commit(ctx, company.id, 'system', 'reward.reverse', { person: person.id, group: groupKey, owed: owedNow, entitled, delta: true }, [
+        ["INSERT INTO reward (id, company_id, person_id, kind, group_key, idem_key, amount, period_key, month_key, day_key, season_id, event_id, state, note, created_at, sent_amount) VALUES (?,?,?,'reversal',?,?,?,?,?,?,?,NULL,'recorded',?,?,0)",
+          newId('rw'), company.id, person.id, groupKey, idem, -d, periodKey ?? null, monthKey(at), dayKey(at), (await seasonAt(ctx, company.id, at))?.id ?? null, JSON.stringify({ reason, delta: true, owed: owedNow, cut: d - owedNow }), ctx.now()],
+        ...(owedNow > 0 ? [["INSERT INTO correction (id, company_id, person_id, amount, state, reason, event_id, created_at) VALUES (?,?,?,?, 'open', ?, NULL, ?)", newId('cr'), company.id, person.id, owedNow, reason, ctx.now()]] : []),
       ]);
-      out.owed = d;
+      out.owed = owedNow;
     } catch (e) { if (!/idem_key/i.test(String(e?.message))) throw e; } // another settle run did the same delta
   }
   // `paid` and the reversal count `gen` come from ONE statement, so the key below never mixes a stale paid with a fresher gen.
   const snap = await ctx.db.first(`SELECT
     (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}) AS paid,
-    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
+    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
   company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
   if (entitled > paid) {
@@ -97,7 +116,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     // under a new key; a voided earlier grant did not, so it replays (a void row is never paid a second time).
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
     const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n; // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
-    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed'", company.id, person.id, groupKey)).n < 3 ? `:x${stale}` : '');
+    const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && await quickRetryDue(ctx, company, person, groupKey) ? `:x${stale}` : '');
     const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system' });
     out.paid = g.paid;
     if (g.failed || g.reason === 'failed_before') out.failedCode = g.reward?.last_error ?? 'failed';
@@ -130,6 +149,7 @@ async function blockedAt(ctx, company, key) {
  * (unsupported, unauthorized, misconfigured, rate limit, timeout...) never writes a block. A changed entitlement is a new key.
  */
 async function safeSettle(ctx, company, report, args) {
+  if (args.person?.erased_at) return { paid: 0, reversed: 0 }; // an erased leaver is never paid or settled again
   const key = await keyOf(args);
   const isReversal = args.entitled < (await paidSum(ctx, company.id, args.person.id, args.groupKey));
   const at = await blockedAt(ctx, company, key);

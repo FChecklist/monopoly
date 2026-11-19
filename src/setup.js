@@ -240,7 +240,7 @@ export async function placeOrder(ctx, company, person, itemId) {
   const hold = { hold_id: res.result.hold_id };
   const approve = item.needs_approval === 0;
   await commit(ctx, company.id, person.id, 'order.place', { id, item: item.id, credits: item.credits }, [['INSERT INTO catalogue_order (id, company_id, person_id, item_id, credits, state, hold_id, created_at) VALUES (?,?,?,?,?,?,?,?)', id, company.id, person.id, item.id, item.credits, 'reserved', hold.hold_id, ctx.now()], ['UPDATE provider_op SET settled = 1 WHERE id = ?', rop.id]]);
-  if (approve) return decideOrder(ctx, company, { id: 'system', role: 'admin' }, id, true);
+  if (approve) return decideOrder(ctx, company, { id: 'system', role: 'admin' }, id, true, { auto: true });
   return { id, state: 'reserved' };
 }
 /** Call the provider for an order decision and record it (once). */
@@ -264,6 +264,10 @@ export async function finishOrders(ctx, company) {
   let n = 0;
   for (const op of await unsettled(ctx, company.id, 'order_decide')) {
     // A decision the provider refused (an auto-approved order whose decision was refused): it is not left behind. The order stays 'reserved' (shown to the admin) and a new decision may be made.
+    if (op.state === 'refused' && op.last_code !== 'hold_expired' && op.params.accept) {
+      const o = await ctx.db.first("SELECT o.* FROM catalogue_order o JOIN catalogue_item i ON i.id = o.item_id WHERE o.id = ? AND o.state = 'reserved' AND i.needs_approval = 0", op.subject);
+      if (o) { try { await declineAutoOrder(ctx, company, 'system', o, op, op.last_code ?? 'refused'); } catch (e) { if (!(e instanceof ProviderError)) throw e; } continue; }
+    }
     if (op.state === 'refused' && op.last_code !== 'hold_expired') { await ctx.db.run("DELETE FROM provider_op WHERE id = ? AND state = 'refused'", op.id); continue; }
     try { if ((await driveOrder(ctx, company, op)).state === 'landed') n++; } catch (e) { if (!(e instanceof ProviderError)) throw e; } }
   for (const op of await unsettled(ctx, company.id, 'order_reserve')) {
@@ -273,7 +277,7 @@ export async function finishOrders(ctx, company) {
       const prov = ctx.provider(company);
       const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', op.params.person);
       const ref = await accountRef(ctx, company, person);
-      const res = await run(ctx, company, op, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: op.subject, idem: 'order:' + op.subject, item: p.item }));
+      const res = await run(ctx, company, op, (p) => prov.reserveSpend({ accountRef: ref, amount: p.credits, ref: op.subject, idem: 'order:' + op.subject, item: p.item }), { believe: ['insufficient_credits', 'no_item', 'price_changed'] });
       if (res.state === 'refused') { await settleOp(ctx, op); continue; }
       if (res.state !== 'landed') continue;
       const rel = await intend(ctx, company, { kind: 'order_release', key: 'orel:' + op.subject, subject: op.subject, params: { hold: res.result.hold_id } });
@@ -283,7 +287,19 @@ export async function finishOrders(ctx, company) {
   }
   return n;
 }
-export async function decideOrder(ctx, company, actor, orderId, accept) {
+/** An auto-approved order whose capture was refused for good: it is declined with the reason, the hold goes back, the person sees a plain state (not "reserved" plus an error). */
+export async function declineAutoOrder(ctx, company, actorId, o, op, code) {
+    // An auto-approved order whose capture was refused for good: it is declined with the reason, the hold goes back, the person sees a plain state (not "reserved" plus an error).
+    await commit(ctx, company.id, actorId, 'order.declined', { id: o.id, code: code }, [["UPDATE catalogue_order SET state = 'declined' WHERE id = ? AND state = 'reserved'", o.id], ['UPDATE provider_op SET settled = 1 WHERE id = ?', op.id]]);
+    try {
+      const rel = await intend(ctx, company, { kind: 'order_release', key: 'orel:' + o.id, subject: o.id, params: { hold: o.hold_id } });
+      const prov = ctx.provider(company);
+      const r2 = await run(ctx, company, rel, (p) => prov.releaseSpend({ holdId: p.hold, idem: 'orel:' + o.id }), { okCodes: ['hold_expired'], believeRefusal: false });
+      if (r2.state === 'landed') await settleOp(ctx, rel);
+    } catch { /* the hold goes back by itself when it expires */ }
+  return { id: o.id, state: 'declined', reason: code };
+}
+export async function decideOrder(ctx, company, actor, orderId, accept, { auto = false } = {}) {
   must(actor, 'admin', 'hr');
   const o = await ctx.db.first("SELECT * FROM catalogue_order WHERE id = ? AND company_id = ? AND state = 'reserved'", orderId, company.id);
   if (!o) throw new ApiError(404, 'no_order', 'No order waiting.');
@@ -293,6 +309,7 @@ export async function decideOrder(ctx, company, actor, orderId, accept) {
   if (op.params.accept !== !!accept) throw new ApiError(409, 'already_decided', 'This order was already decided.');
   const out = await driveOrder(ctx, company, op, actor.id);
   if (out.state === 'refused' && out.code === 'hold_expired') return { id: o.id, state: 'expired' };
+  if (out.state === 'refused' && auto) return declineAutoOrder(ctx, company, actor.id, o, op, out.code);
   if (out.state === 'refused') { await ctx.db.run("DELETE FROM provider_op WHERE id = ? AND state = 'refused'", op.id); throw new ApiError(502, out.code, 'The credit provider refused this decision.'); } // a clear first no: a new decision may be tried
   if (out.state !== 'landed') throw new ApiError(502, out.code ?? 'provider_down', 'The credit provider did not confirm; the decision is kept and the tick finishes it.');
   return { id: o.id, state };

@@ -405,6 +405,7 @@ route('POST', '/api/admin/buy', async (c) => {
 });
 route('POST', '/api/admin/settle', async (c) => { adm(c); return settleCompany(c.ctx, c.company, c.ctx.now(), { force: c.body.force === true }); });
 route('POST', '/api/admin/retry-ops', async (c) => { adm(c); return retryOps(c.ctx, c.company); });
+route('POST', '/api/admin/retry-partials', async (c) => { adm(c); return R.retryPartialsNow(c.ctx, c.company); });
 route('POST', '/api/admin/retry-handbacks', async (c) => { adm(c); return Pen.retryExhaustedHandbacks(c.ctx, c.company); });
 route('POST', '/api/admin/revive-failed', async (c) => { adm(c); return R.reviveFailedRewards(c.ctx, c.company, c.user?.id ?? 'admin', { force: c.body?.force === true }); });
 route('POST', '/api/admin/tick', async (c) => { adm(c); return tick(c.ctx, c.company); });
@@ -438,7 +439,8 @@ route('GET', '/api/admin/overview', async (c) => {
     rewards_voided_silent: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'void' AND last_error IN ('season_closed','no_season','season_cap','person_erased')", cid),
     last_tick_at: lastOk || null,
     tick_stale: (c.ctx.now() - (lastOk || c.company.created_at || 0)) > 3600_000,
-    warnings: providerCapWarnings(c.company),
+    warnings: providerCapWarnings(c.company, (await c.ctx.db.first("SELECT MAX(m) n FROM (SELECT MAX(t.bonus) m FROM tier t JOIN period_target p ON p.id = t.target_id WHERE p.company_id = ? UNION ALL SELECT MAX(bonus) FROM streak WHERE company_id = ?)", cid, cid))?.n ?? 0),
+    rewards_waiting_revived: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'waiting' AND last_error = 'revived'", cid),
     rewards_stuck: await q("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'queued' AND attempts >= 10", cid),
     rights_open: await q("SELECT COUNT(*) n FROM rights_request WHERE company_id = ? AND state = 'open'", cid),
     ai_enabled: settingsOf(c.company).ai_enabled === true,
@@ -446,7 +448,7 @@ route('GET', '/api/admin/overview', async (c) => {
     used_budget: (await c.ctx.db.first("SELECT COALESCE(SUM(amount),0) n FROM reward WHERE company_id = ? AND amount > 0 AND state IN ('queued','sent')", cid)).n,
   };
   // One plain line per thing that needs an admin: no code, no names.
-  const say = { open_partial_grants: 'Some credits were granted only in part (the provider cap was short); the rest is retried every 6 hours.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link, then use retry-ops.', open_failed_periods: 'A period bonus failed for good for some people: fix the cause, then use revive-failed.', rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
+  const say = { open_partial_grants: 'Some credits were granted only in part: the rest is blocked by a provider cap (lifetime, daily or per bonus). It is retried every 6 hours, then daily, with no end; use retry-partials to try now.', open_orders_stuck: 'A shop order could not be finished for a day or more: check the provider link; the clock keeps retrying it.', open_failed_periods: 'A period bonus failed for good for some people: fix the cause (for example the provider cap), then use revive-failed. It is also tried once a week by itself.', rewards_waiting_revived: 'Revived rewards are waiting for a cap or the budget to allow them.', rewards_voided_silent: 'Some rewards were voided because the season had closed or a cap was reached.', open_handbacks_failed: 'Credit hand-backs gave up: use retry-handbacks.', open_failed_rewards: 'Rewards failed for good: fix the cause, then use revive-failed.', open_restores_failed: 'Restores of a lost-race debit gave up: ask support.', open_holds_failed: 'A hold or an order step could not be confirmed and stopped retrying: use retry-ops.', open_reverses_failed: 'A reversal of a credit could not be confirmed and stopped retrying: ask support.', open_debits_failed: 'A penalty debit could not be confirmed and stopped retrying: ask support.', rewards_stuck: 'Rewards were tried 10 times and are still on their way: check the Moneypenny link.' };
   o.alerts = Object.entries(say).filter(([k]) => o[k] > 0).map(([k, t]) => `${t} (${o[k]})`);
   if (o.tick_stale) o.alerts.push('Nothing has run the clock for over an hour: set up the scheduler (docs/DEPLOY.md) or open the app regularly.');
   o.alerts.push(...o.warnings);
@@ -474,11 +476,22 @@ export async function lazyTick(ctx, company) {
   return true;
 }
 async function tickBody(ctx, company, limit) {
-  return {
-    sent: await R.retryQueued(ctx, company, limit), released: await R.releaseWaiting(ctx, company), resumed: await E.resumeApproved(ctx, company),
-    reversals: await E.processReversals(ctx, company), penalties: await Pen.tickPenalties(ctx, company), settled: await settleCompany(ctx, company, ctx.now()),
-    orders: await S.finishOrders(ctx, company), ai_resumed: await AI.resumeAiRuns(ctx, company), purged: await AI.purgeAiData(ctx, company),
-  };
+  // Every stage runs on its own: one that throws is recorded (one audit line per stage per day) and never stops the others.
+  const out = {};
+  const stages = [
+    ['sent', () => R.retryQueued(ctx, company, limit)], ['released', () => R.releaseWaiting(ctx, company)], ['resumed', () => E.resumeApproved(ctx, company)],
+    ['reversals', () => E.processReversals(ctx, company)], ['penalties', () => Pen.tickPenalties(ctx, company)], ['settled', () => settleCompany(ctx, company, ctx.now())],
+    ['orders', () => S.finishOrders(ctx, company)], ['ai_resumed', () => AI.resumeAiRuns(ctx, company)], ['purged', () => AI.purgeAiData(ctx, company)],
+  ];
+  for (const [name, fn] of stages) {
+    try { out[name] = await fn(); } catch (e) {
+      out[name] = { error: e?.code ?? 'internal' };
+      try {
+        if (!(await ctx.db.first("SELECT 1 x FROM audit WHERE company_id = ? AND action = 'tick.stage_error' AND at > ? AND instr(data, ?) > 0", company.id, ctx.now() - DAY, '"stage":"' + name + '"'))) await commit(ctx, company.id, 'system', 'tick.stage_error', { stage: name, code: String(e?.code ?? 'internal').slice(0, 40) });
+      } catch { /* the next tick writes it */ }
+    }
+  }
+  return out;
 }
 
 // ---------- signed system routes (older paths, still served) ----------

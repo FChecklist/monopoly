@@ -178,6 +178,7 @@ test('Y10 X6: a queued reward of an erased person is voided with a reason (no th
   w.ctx.provider = () => wrap(real, { credit: async () => { throw new ProviderError('provider_down'); } });
   const g = await grant(w.ctx, w.company, { person: w.people.b, kind: 'tier', amount: 20, idem: 'y10', groupKey: 'g10', periodKey: 'W1', at: w.clock.t });
   assert.equal(g.reward.state, 'queued');
+  await w.db.run('UPDATE reward SET attempts = 0 WHERE id = ?', g.reward.id); // never tried: nothing can have landed
   await w.db.run('UPDATE app_user SET erased_at = ? WHERE id = ?', w.clock.t, w.people.b.id);
   const out = await sendReward(w.ctx, w.company, await w.db.first('SELECT * FROM reward WHERE id=?', g.reward.id));
   assert.equal(out.state, 'void'); assert.equal(out.last_error, 'person_erased');

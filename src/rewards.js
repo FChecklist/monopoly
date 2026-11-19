@@ -161,7 +161,9 @@ export async function sendReward(ctx, company, r) {
     return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
   }
   const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
-  if (!person || person.erased_at) { // an erased leaver cannot be paid: the row is voided with a plain reason (the corrections it took go back), it never throws
+  const noteNow = JSON.parse(r.note || '{}');
+  if ((!person || person.erased_at) && r.attempts > 0 && !noteNow.acct) return r; // an earlier try may have landed and the account it used is unknown: keep it queued (rewards_stuck shows it) until an admin decides
+  if ((!person || person.erased_at) && !(r.attempts > 0)) { // an erased leaver cannot be paid: the row is voided with a plain reason (the corrections it took go back), it never throws
     const n0 = JSON.parse(r.note || '{}');
     const own = "EXISTS (SELECT 1 FROM reward WHERE id = ? AND state = 'queued')";
     const st = [];
@@ -176,18 +178,22 @@ export async function sendReward(ctx, company, r) {
   // If this changes no row, somebody (a void, or another sender) got there first: the provider is NOT called.
   const marked = await ctx.db.run("UPDATE reward SET attempts = attempts + 1 WHERE id = ? AND state = 'queued'", r.id);
   if (marked.changes === 0) return ctx.db.first('SELECT * FROM reward WHERE id = ?', r.id);
+  let usedRef = null;
   try {
     let prov;
     try { prov = ctx.provider(company); } catch (e) { // whatever the provider setup says (missing key, bad URL, unknown provider) is OUR configuration: the row waits, it never fails
       throw e instanceof ProviderError && !(e.retriable || isTransient(e.code)) ? new ProviderError('misconfigured', e.message) : e;
     }
-    const ref = await accountRef(ctx, company, person);
+    // The same key must carry the same body: a retry uses the account of the FIRST try (kept sealed on the row), even if the e-mail changed since.
+    const ref = noteNow.acct ? await ctx.unseal(noteNow.acct, 'reward.acct:' + r.id) : await accountRef(ctx, company, person);
+    usedRef = ref;
     const caps = await prov.capabilities();
     const res = await prov.credit({ accountRef: ref, amount: r.sent_amount, fromHoldId: caps.hold ? season?.hold_id : undefined, expiresAt: null, reasonCode: r.kind, ref: r.id, idem: r.idem_key });
     const got = Number.isInteger(res.granted) && res.granted > 0 && res.granted < r.sent_amount ? res.granted : r.sent_amount; // partial grant is recorded as partial
     await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, sent_amount=?, last_error=? WHERE id=? AND state='queued'", res.entry_id ?? r.idem_key, ctx.now(), got, got < r.sent_amount ? 'partial_grant' : null, r.id);
   } catch (e) {
     if (!(e instanceof ProviderError)) throw e;
+    if (usedRef && !noteNow.acct && (e.retriable || isTransient(e.code) || e.code === 'duplicate' || true)) { try { await ctx.db.run("UPDATE reward SET note = json_set(COALESCE(note, '{}'), '$.acct', ?) WHERE id = ? AND json_extract(COALESCE(note, '{}'), '$.acct') IS NULL AND state = 'queued'", await ctx.seal(usedRef, 'reward.acct:' + r.id), r.id); } catch { /* the next try stores it */ } }
     if (e.code === 'duplicate') { // the provider says this reference is already credited (duplicate_ref): it landed earlier, mark it sent
       await ctx.db.run("UPDATE reward SET state='sent', provider_ref=?, sent_at=?, last_error=NULL WHERE id=? AND state='queued'", r.idem_key, ctx.now(), r.id);
     } else if (e.retriable || isTransient(e.code)) { // configuration / provider-state problems are never permanent: the row stays queued and every tick retries it
@@ -231,7 +237,7 @@ async function failReward(ctx, company, r, code) {
   await commit(ctx, company.id, 'system', 'reward.failed', { id: r.id, code }, stmts);
 }
 
-const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1) AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))"; // a reward of an event that was reversed is never revived // period rows with one try revive themselves under a new key (x<n>) after the block time
+const REVIVABLE = "company_id=? AND state='failed' AND amount>0 AND kind NOT IN ('reversal','penalty_return') AND (event_id IS NOT NULL OR attempts > 1 OR (kind IN ('tier','streak','team') AND (SELECT COUNT(*) FROM reward f WHERE f.company_id = reward.company_id AND f.person_id = reward.person_id AND f.group_key = reward.group_key AND f.state = 'failed') >= 3)) AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))"; // a reward of an event that was reversed is never revived // period rows with one try revive themselves under a new key (x<n>) after the block time
 const MAX_REVIVES = 5;
 /** Failed event rewards (and period rows tried more than once) that wait for an admin. Shown as open_failed_rewards in the overview. */
 export const openFailedRewards = async (ctx, companyId) => (await ctx.db.first('SELECT COUNT(*) n FROM reward WHERE ' + REVIVABLE, companyId)).n;
@@ -241,12 +247,21 @@ export const openFailedRewards = async (ctx, companyId) => (await ctx.db.first('
  */
 export async function reviveFailedRewards(ctx, company, actor = 'admin', { force = false } = {}) {
   let revived = 0;
-  for (const r of await ctx.db.all('SELECT * FROM reward WHERE ' + REVIVABLE + ' ORDER BY created_at', company.id)) {
+  const seenGroup = new Set();
+  for (const r of await ctx.db.all('SELECT * FROM reward WHERE ' + REVIVABLE + ' ORDER BY created_at DESC', company.id)) {
     const n = JSON.parse(r.note || '{}');
+    if (r.event_id == null) { // a period entitlement failed on several daily tries (one row per try): ONE of them (the latest) is revived, the older ones are the same entitlement and are voided, so it is paid once
+      const gk = r.person_id + '|' + r.group_key;
+      if (seenGroup.has(gk)) { await commit(ctx, company.id, actor, 'reward.void', { orig: r.id, reason: 'superseded_by_revive' }, [["UPDATE reward SET state='void', last_error='superseded_by_revive' WHERE id=? AND state='failed'", r.id]], { onlyIfChanged: true }); continue; }
+      seenGroup.add(gk);
+    }
     if ((n.revives ?? 0) >= MAX_REVIVES && !force) continue; // force: an admin may go beyond the limit
     // The first credit may have reached the provider: the revived credit must repeat the SAME amount (same key), so the amount and the takes of the first try are kept.
-    const note = JSON.stringify({ ...n, offset: r.amount - r.sent_amount, takes: [], takes0: n.takes ?? [], sent0: r.sent_amount, revives: (n.revives ?? 0) + 1 });
-    const stmts = [["UPDATE reward SET state='waiting', last_error='revived', note=? WHERE id=? AND state='failed' AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))", note, r.id]];
+    const isPeriod = r.event_id == null;
+    // An event row repeats its first amount and key (it may have landed). A period row is the same ENTITLEMENT again: computed fresh and sent under a fresh :v<n> key.
+    const note = JSON.stringify(isPeriod ? { ...n, offset: 0, takes: [], revives: (n.revives ?? 0) + 1 } : { ...n, offset: r.amount - r.sent_amount, takes: [], takes0: n.takes ?? [], sent0: r.sent_amount, revives: (n.revives ?? 0) + 1 });
+    const newKey = String(r.idem_key).replace(/:v\d+$/, '') + ':v' + ((n.revives ?? 0) + 1);
+    const stmts = [[`UPDATE reward SET state='waiting', last_error='revived', note=?${isPeriod ? ', idem_key=?, sent_amount=amount' : ''} WHERE id=? AND state='failed' AND (event_id IS NULL OR EXISTS (SELECT 1 FROM event e WHERE e.id = reward.event_id AND e.status = 'applied'))`, note, ...(isPeriod ? [newKey] : []), r.id]];
     const res = await commit(ctx, company.id, actor, 'reward.revived', { id: r.id, was: r.last_error }, stmts, { onlyIfChanged: true });
     if (res[res.length - 1].changes > 0) revived++;
   }
@@ -273,36 +288,62 @@ export async function healPendingReverses(ctx, company, personId, groupKey) {
   return healed;
 }
 
-const PARTIAL_EVERY = 6 * 3600_000, PARTIAL_MAX = 20;
-/** Rows that were granted only in part (the provider's own cap was short): count of rows whose remainder is still open. */
-export const openPartialGrants = async (ctx, companyId) => (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'sent' AND reversed = 0 AND last_error = 'partial_grant' AND amount - COALESCE(json_extract(note, '$.offset'), 0) > sent_amount", companyId)).n;
+const PARTIAL_QUICK = 8, PARTIAL_QUICK_EVERY = 6 * 3600_000, PARTIAL_SLOW_EVERY = DAY;
+const remOf = (r, note) => r.amount - (note.offset ?? 0) - (note.remCut ?? 0) - r.sent_amount;
+/** Rows that were granted only in part (the provider's own cap was short) and whose remainder is still open. */
+export const openPartialGrants = async (ctx, companyId) => (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id = ? AND state = 'sent' AND reversed = 0 AND last_error = 'partial_grant' AND amount - COALESCE(json_extract(note, '$.offset'), 0) - COALESCE(json_extract(note, '$.remCut'), 0) > sent_amount", companyId)).n;
 /**
- * The remainder of a partial grant is paid later, under its own key (<key>:r<k>), at most every 6 hours and PARTIAL_MAX times; a zero grant moves to a new key (the provider
- * replays a zero answer for the same key). What was really granted is added to sent_amount in one guarded write, so a reversal owes only what was credited.
+ * The remainder of a partial grant is paid later under its own key AND its own reference (<key>:r<k>, <id>:r<k>; Moneypenny refuses a reused reference).
+ * The first 8 tries are 6 hours apart, then one a day, with no hard stop until the remainder is paid or the row is reversed or cut by a lower entitlement.
+ * The call is announced on the row first (note.inflight): a reversal or a drop waits for it, and a lost reply replays the SAME key, so what was credited is always what is recorded.
  */
-export async function topUpPartials(ctx, company) {
+export async function topUpPartials(ctx, company, { force = false } = {}) {
   let paid = 0;
   for (const r of await ctx.db.all("SELECT * FROM reward WHERE company_id = ? AND state = 'sent' AND reversed = 0 AND last_error = 'partial_grant' ORDER BY created_at LIMIT 50", company.id)) {
-    const note = JSON.parse(r.note || '{}');
-    const rem = r.amount - (note.offset ?? 0) - r.sent_amount;
-    if (rem <= 0) { await ctx.db.run("UPDATE reward SET last_error = NULL WHERE id = ? AND last_error = 'partial_grant'", r.id); continue; }
-    const k = note.remK ?? 0;
-    if (k >= PARTIAL_MAX || ctx.now() - (note.remAt ?? r.sent_at ?? 0) < PARTIAL_EVERY) continue;
-    const save = (extra, add) => ctx.db.run("UPDATE reward SET sent_amount = sent_amount + ?, last_error = CASE WHEN sent_amount + ? >= amount - ? THEN NULL ELSE 'partial_grant' END, note = ? WHERE id = ? AND sent_amount = ?", add, add, note.offset ?? 0, JSON.stringify({ ...note, ...extra }), r.id, r.sent_amount);
-    try {
+    let note = JSON.parse(r.note || '{}'), curNote = r.note;
+    const rem = remOf(r, note);
+    if (rem <= 0 && !note.inflight) { await ctx.db.run("UPDATE reward SET last_error = NULL WHERE id = ? AND last_error = 'partial_grant'", r.id); continue; }
+    let k = note.remK ?? 0, amount = rem, acct = null;
+    if (note.inflight) { k = note.inflight.k; amount = note.inflight.amount; acct = note.inflight.acct ?? null; } // a call that was cut short: replay the same key and body
+    else {
+      const every = k < PARTIAL_QUICK ? PARTIAL_QUICK_EVERY : PARTIAL_SLOW_EVERY;
+      if (!force && ctx.now() - (note.remAt ?? r.sent_at ?? 0) < every) continue;
       const person = await ctx.db.first('SELECT * FROM app_user WHERE id = ?', r.person_id);
       if (!person || person.erased_at) continue;
-      const res = await ctx.provider(company).credit({ accountRef: await accountRef(ctx, company, person), amount: rem, reasonCode: r.kind, ref: r.id, idem: `${r.idem_key}:r${k}` });
-      const got = Number.isInteger(res.granted) && res.granted > 0 && res.granted < rem ? res.granted : rem;
-      await save({ remK: got < rem ? k + 1 : k, remAt: ctx.now() }, got);
+      try { acct = await ctx.seal(await accountRef(ctx, company, person), 'reward.acct:' + r.id); } catch { continue; }
+      const marked = JSON.stringify({ ...note, inflight: { k, amount, acct } });
+      const claim = await ctx.db.run("UPDATE reward SET note = ? WHERE id = ? AND reversed = 0 AND state = 'sent' AND note IS ? AND sent_amount = ?", marked, r.id, r.note, r.sent_amount);
+      if (claim.changes === 0) continue;
+      note = JSON.parse(marked); curNote = marked;
+    }
+    const refStr = `${r.id}:r${k}`, key = `${r.idem_key}:r${k}`;
+    const finish = (extra, add) => { const { inflight, ...rest } = note; return ctx.db.run("UPDATE reward SET sent_amount = sent_amount + ?, last_error = CASE WHEN sent_amount + ? >= amount - ? - ? THEN NULL ELSE 'partial_grant' END, note = ? WHERE id = ? AND reversed = 0 AND sent_amount = ? AND note IS ?", add, add, note.offset ?? 0, note.remCut ?? 0, JSON.stringify({ ...rest, ...extra }), r.id, r.sent_amount, curNote); };
+    try {
+      const prov = ctx.provider(company);
+      const res = await prov.credit({ accountRef: await ctx.unseal(acct, 'reward.acct:' + r.id), amount, reasonCode: r.kind, ref: refStr, idem: key });
+      const got = Number.isInteger(res.granted) && res.granted > 0 && res.granted < amount ? res.granted : amount;
+      await finish({ remK: got < amount ? k + 1 : k, remAt: ctx.now() }, got);
       paid += got;
     } catch (e) {
       if (!(e instanceof ProviderError)) throw e;
-      if (e.code === 'cap_reached') await save({ remK: k + 1, remAt: ctx.now() }, 0); // a zero grant: next time under a new key
+      if (e.code === 'cap_reached') await finish({ remK: k + 1, remAt: ctx.now() }, 0); // a zero grant: next time under a new key and reference
+      else if (e.code === 'duplicate') {
+        // The provider says this reference exists. Believed only when its history shows it; otherwise it is retried, and after 3 unconfirmed answers the number moves on.
+        let line = null;
+        try { line = ((await ctx.provider(company).history({ accountRef: await ctx.unseal(acct, 'reward.acct:' + r.id), limit: 100 })).lines ?? []).find((l) => l.ref === refStr || l.ref === 'manual:' + refStr); } catch { /* not confirmed */ }
+        if (line) { const got = Math.min(Number.isInteger(line.amount) && line.amount > 0 ? line.amount : amount, amount); await finish({ remK: got < amount ? k + 1 : k, remAt: ctx.now() }, got); paid += got; }
+        else {
+          const dups = (note.inflight?.dups ?? 0) + 1;
+          if (dups >= 3) await finish({ remK: k + 1, remAt: ctx.now() }, 0);
+          else await ctx.db.run('UPDATE reward SET note = ? WHERE id = ? AND note IS ?', JSON.stringify({ ...note, inflight: { ...note.inflight, dups } }), r.id, curNote);
+        }
+      } // any other (retriable) error: the call stays announced and the next tick replays it
     }
   }
   return paid;
 }
+/** Admin action: try every open remainder now. */
+export async function retryPartialsNow(ctx, company) { return { paid: await topUpPartials(ctx, company, { force: true }) }; }
 
 /** Retry everything that is "on its way". Run by tick() (admin button, signed /api/ingest/tick, or the lazy tick). */
 export async function retryQueued(ctx, company, limit = 100) {
@@ -475,6 +516,7 @@ async function voidWaiting(ctx, company, r, n, reason) {
 export async function reverseReward(ctx, company, r, { reason, actor = 'system', eventId = null }) {
   if (r.reversed || r.amount <= 0 || r.kind === 'reversal') return { reversed: 0, owed: 0, skipped: true };
   const base = { reason, orig: r.id, amount: r.amount };
+  if (r.state === 'sent' && JSON.parse((await ctx.db.first('SELECT note FROM reward WHERE id = ?', r.id))?.note || '{}').inflight) return { reversed: 0, owed: 0, skipped: true, pending: true, code: 'topup_pending' }; // a top-up of the remainder is in flight: decide after it is recorded
   if (r.state === 'queued' && r.attempts > 0) {
     r = await sendReward(ctx, company, r);
     if (r.state === 'queued') return { reversed: 0, owed: 0, skipped: true, pending: true }; // still not confirmed: try again next close

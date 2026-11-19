@@ -53,7 +53,8 @@ Audit rounds 6-16, verdicts (A = money, B = simulation / second auditor):
 - 13: A PASS, B FAIL (U1-U6 overlapping workers, give-up permanence, audit growth); answered with the provider_op state machine (docs/design/PROVIDER-OPS.md).
 - 14: both FAIL, only inside provider_op / raiseBudget (V1-V5). Answer: v1 became credit-only (below), V1 and V3 fixed, V2 got a hold_id compare-and-set.
 - 15: both FAIL on the credit path (X1-X9: expiring order holds, v1 delta settlement, partial grants, no scheduler, revive underpay, error mapping, overview). Fixed in round 16 (test/money-round16.test.js).
-- 16: awaiting the next audit.
+- 16: both FAIL on the credit path (Z1-Z7: top-up reference reuse, erased people re-settled, failed period bonus never revived, partial top-up hard stop, top-up vs reversal race, email change vs lost reply, order/clock leftovers). Fixed in round 17 (test/money-round17.test.js).
+- 17: awaiting the next audit.
 
 NOT ENABLED IN v1 (code kept, unreachable, unaudited): season budget holds, credit-loss penalties (debit and restore), credit reversals. src/v1.js is the one place: every provider goes through a wrapper (src/provider/index.js) that reports hold, debit and reverse as false; a real provider that declares them is a configuration error ('not enabled in v1'); the setting penalty_credit_loss cannot be switched on; makeCtx refuses to start with the test switch in a production environment. Only the demo provider of a non-live company with FUTURE_OPS=1 (tests, local demos) reaches those paths; the old tests of those paths (money-round2..14) run with that switch and are 'future'. Without it (world({ v1: true })): no season hold, a lost tier is a correction instead of a reverse, penalties are points and steps only.
 
