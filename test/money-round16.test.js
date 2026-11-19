@@ -181,18 +181,18 @@ test('Y10 X6: a queued reward of an erased person is voided with a reason (no th
   await w.db.run('UPDATE reward SET attempts = 0 WHERE id = ?', g.reward.id); // never tried: nothing can have landed
   await w.db.run('UPDATE app_user SET erased_at = ? WHERE id = ?', w.clock.t, w.people.b.id);
   const out = await sendReward(w.ctx, w.company, await w.db.first('SELECT * FROM reward WHERE id=?', g.reward.id));
-  assert.equal(out.state, 'void'); assert.equal(out.last_error, 'person_erased');
+  assert.equal(out.state, 'void'); assert.equal(out.last_error, 'voided_erased');
   await accountRef(w.ctx, w.company, await w.db.first('SELECT * FROM app_user WHERE id=?', w.people.a.id));
   assert.ok((await w.db.first('SELECT provider_account_ref r FROM app_user WHERE id=?', w.people.a.id)).r);
   await correctDetails(w.ctx, w.company, w.admin, w.people.a.id, { email: 'new-a@acme.test' });
   assert.equal((await w.db.first('SELECT provider_account_ref r FROM app_user WHERE id=?', w.people.a.id)).r, null);
 });
 
-test('Y11 X7: a provider that says "duplicate" for a credit has it already: the row is marked sent, not failed', async () => {
+test('Y11 X7: a provider that says "duplicate" for a credit has it already: the amount comes from the history; unconfirmed it needs an admin (round 18)', async () => {
   const w = await world(); const real = w.ctx.provider(w.company);
   w.ctx.provider = () => wrap(real, { credit: async () => { throw new ProviderError('duplicate'); } });
   const g = await grant(w.ctx, w.company, { person: w.people.a, kind: 'tier', amount: 20, idem: 'y11', groupKey: 'g11', periodKey: 'W1', at: w.clock.t });
-  assert.equal(g.reward.state, 'sent');
+  assert.equal(g.reward.state, 'failed'); assert.equal(g.reward.last_error, 'duplicate_unconfirmed');
 });
 
 test('Y12 X8/X9: me/rewards shows sent_amount; silent voids are counted; a failed period row is not auto-revived when it was tried more than once', async () => {

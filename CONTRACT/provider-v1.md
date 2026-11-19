@@ -48,4 +48,6 @@ Rewards stay `queued` ("on its way") with the same key and are retried by the ti
 After 24 hours the admin overview shows them. Nothing is ever paid twice.
 
 ## Not enabled in v1
+Also not enabled in v1 (round 18): topping up a partial grant (refs `<id>:r<k>`), reviving failed rewards (`revive-failed`, `:v<n>`, `:short`, weekly slow retry) and any credit above 500 in one bonus. A failed or partial reward is closed by an admin who checked the ledger and re-issued as a NEW grant (`POST /api/admin/reissue`).
+
 The game does not use hold, debit or reverse in v1 even when a provider declares them: the game forces them to false, and a real provider that declares them true is treated as a configuration error ('not enabled in v1'). Code for them is kept, unreachable and unaudited. Reward credit, balance, spend (shop orders) and purchase links are the v1 surface.

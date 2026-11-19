@@ -8,7 +8,7 @@ import { ensureBoard } from './board.js';
 export const ROLES = ['admin', 'manager', 'hr', 'employee'];
 
 export async function createCompany(ctx, { name, slug, provider = 'stub', adminEmail, adminName = 'Admin', settings = {} }) {
-  assertV1Settings(ctx.env, { live: 0 }, settings);
+  assertV1Settings(ctx.env, { live: 0, provider }, settings);
   slug = String(slug).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40);
   if (!slug || !name) throw new ApiError(400, 'bad_company', 'Name and slug are needed.');
   const id = newId('co');

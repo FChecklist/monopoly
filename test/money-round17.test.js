@@ -1,3 +1,4 @@
+// FUTURE (not enabled in v1; runs only under the test-only FUTURE_OPS switch): top-ups, revive. Round 18 moved v1 to ledger-check + re-issue (money-round18).
 // Round-17 (credit-path audit 16): partial top-ups under their own reference, erased people, period revive, no hard stop, races, ref stability, orders and the clock.
 // The provider is the REAL Moneypenny adapter talking to a fake that follows Moneypenny's wallet rules:
 // duplicate_ref is checked BEFORE headroom, a bonus is at most manual_bonus_max, a person has a lifetime cap, the tenant a rolling 24h cap.
@@ -107,8 +108,8 @@ test('Z2 an erased person is not settled again: no re-grant, no re-void, no grow
   assert.equal((await w.db.first("SELECT COUNT(*) n FROM reward WHERE state='queued' OR state='waiting'")).n, 0);
 });
 
-test('Z3 a period bonus that failed for good is revived (fresh :v key, same entitlement) and is also tried weekly by itself', async () => {
-  const w = await mworld({ v1: true });
+test('Z3 FUTURE a period bonus that failed for good is revived (fresh :v key, same entitlement) and is also tried weekly by itself', async () => {
+  const w = await mworld({});
   w.f.down = false;
   const real = w.prov; let refuse = true;
   w.ctx.provider = () => wrap(real, { credit: async (x) => { if (refuse) throw new ProviderError('cap_reached', 'x'); return real.credit(x); } });
@@ -136,7 +137,7 @@ test('Z4 a partial top-up never stops: after the quick tries it retries daily, t
   const k1 = JSON.parse(r.note).remK; await w.login('admin');
   const ov = await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal(ov.json.open_partial_grants, 1);
-  assert.ok(ov.json.alerts.some((a) => /cap/.test(a) && /retry-partials/.test(a)), 'the alert names the cap and the action');
+  assert.ok(ov.json.alerts.some((a) => /Moneypenny ledger/.test(a)), 'the alert names the ledger check');
   f.lifetime = 1000;
   const res = await w.call('admin', 'POST', '/api/admin/retry-partials', {});
   assert.equal(res.status, 200); assert.equal(res.json.paid, 80);
@@ -184,7 +185,6 @@ test('Z7 revived waiting rows get an alert line; a tier above the provider bonus
   await w.db.run("INSERT INTO reward (id, company_id, person_id, kind, amount, state, idem_key, created_at, last_error, season_id) VALUES ('rw_z7', ?, ?, 'tier', 10, 'waiting', 'z7', 1, 'revived', NULL)", w.company.id, w.people.a.id);
   const ov = await w.call('admin', 'GET', '/api/admin/overview');
   assert.equal(ov.json.rewards_waiting_revived, 1);
-  assert.ok(ov.json.alerts.some((a) => /Revived/.test(a)));
   assert.ok(providerCapWarnings({ provider: 'moneypenny', settings: '{}' }, 800).some((x) => /single bonus maximum/.test(x)));
   assert.equal(providerCapWarnings({ provider: 'moneypenny', settings: '{}' }, 100).length, 3);
   const { readFileSync } = await import('node:fs');

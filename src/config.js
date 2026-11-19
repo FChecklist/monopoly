@@ -29,10 +29,10 @@ export const MNP_LIMITS = { lifetime_per_person: 800, manual_bonus_max: 500, eve
 export function providerCapWarnings(company, maxBonus = 0) {
   if (company.provider !== 'moneypenny') return [];
   const s = settingsOf(company), w = [];
-  if (s.cap_person_season > MNP_LIMITS.lifetime_per_person) w.push(`The season cap per person (${s.cap_person_season}) is above Moneypenny's per-person lifetime limit (${MNP_LIMITS.lifetime_per_person}): the rest is granted only in part.`);
+  if (s.cap_person_season > MNP_LIMITS.lifetime_per_person) w.push(`The season cap per person (${s.cap_person_season}) is above Moneypenny's per-person lifetime limit (${MNP_LIMITS.lifetime_per_person}): a credit that does not fit is granted only in part and then needs an admin.`);
   if (s.cap_event > MNP_LIMITS.manual_bonus_max) w.push(`The event cap (${s.cap_event}) is above Moneypenny's single bonus maximum (${MNP_LIMITS.manual_bonus_max}).`);
   if (s.daily_event_limit > MNP_LIMITS.events_per_person_day) w.push(`The daily event limit (${s.daily_event_limit}) is above Moneypenny's ${MNP_LIMITS.events_per_person_day} events per person per day.`);
-  if (maxBonus > MNP_LIMITS.manual_bonus_max) w.push(`A tier, streak or team bonus (${maxBonus}) is above Moneypenny's single bonus maximum (${MNP_LIMITS.manual_bonus_max}): it is granted only in part.`);
+  if (maxBonus > MNP_LIMITS.manual_bonus_max) w.push(`A tier, streak or team bonus (${maxBonus}) is above Moneypenny's single bonus maximum (${MNP_LIMITS.manual_bonus_max}): it is refused when it is created.`);
   return w;
 }
 

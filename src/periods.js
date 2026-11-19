@@ -2,6 +2,7 @@
 // All bonuses are settled as an "entitlement": what the person has earned now minus what was already paid.
 // A positive difference is paid once (idempotent). A negative one is reversed. So a later cancellation is corrected at the next close.
 import { settingsOf } from './config.js';
+import { futureOn } from './v1.js';
 import { grant, reverseReward, seasonAt, healPendingReverses } from './rewards.js';
 import { periodOf, prevPeriod, DAY, sha256Hex, newId, monthKey, dayKey } from './util.js';
 import { commit } from './audit.js';
@@ -105,7 +106,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
   // `paid` and the reversal count `gen` come from ONE statement, so the key below never mixes a stale paid with a fresher gen.
   const snap = await ctx.db.first(`SELECT
     (SELECT COALESCE(SUM(amount),0) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state IN ${COUNT}) AS paid,
-    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
+    (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND reversed=1 AND kind != 'reversal' AND NOT (state='void' AND COALESCE(last_error,'') IN ('no_season','season_closed','season_cap','person_erased','voided_erased'))) + (SELECT COUNT(*) FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND kind='reversal' AND idem_key LIKE 'dn:%') AS gen`,
   company.id, person.id, groupKey, company.id, person.id, groupKey, company.id, person.id, groupKey);
   paid = snap.paid;
   if (entitled > paid) {
@@ -115,7 +116,7 @@ export async function settleEntitlement(ctx, company, { person, kind, groupKey, 
     // `p${paid}` is what is already counted: a capped or partly paid earlier grant moved it, so the next run tops up the rest
     // under a new key; a voided earlier grant did not, so it replays (a void row is never paid a second time).
     // A row that FAILED for good (a permanent account error) replays as failed_before. Once it is older than the block time, the next try uses a new key (x<n>), so it is paid after all if the account is fine now.
-    const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n; // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
+    const stale = (await ctx.db.first("SELECT COUNT(*) n FROM reward WHERE company_id=? AND person_id=? AND group_key=? AND state='failed' AND attempts <= 1 AND created_at <= ?", company.id, person.id, groupKey, ctx.now() - BLOCK_TTL)).n * (futureOn(ctx.env, company) ? 1 : 0); // v1: a failed period row is never re-sent by itself (needs an admin) // a row tried more than once may have reached the provider (a lost answer): it is not revived by itself, an admin does it (open_failed_rewards)
     const idem = `${kind}:${person.id}:${periodKey}:${groupKey.split(':')[1]}:g${gen}:e${entitled}:p${paid}` + (stale && await quickRetryDue(ctx, company, person, groupKey) ? `:x${stale}` : '');
     const g = await grant(ctx, company, { person, kind, amount: entitled - paid, idem, groupKey, periodKey, at, periodBonus: true, actor: 'system' });
     out.paid = g.paid;

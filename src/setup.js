@@ -1,4 +1,5 @@
 // Company setup: teams, rate card (versioned), period targets, tiers, streaks, seasons, cards, desks, rules, keys, shop.
+import { assertCreditAmount } from './v1.js';
 import { ApiError, newId, mustInt, clean, hmacHex, DAY, periodOf, PERIODS } from './util.js';
 import { commit } from './audit.js';
 import { settingsOf } from './config.js';
@@ -30,6 +31,7 @@ export async function addRateCard(ctx, company, actor, input) {
   must(actor, 'admin');
   const type = word(input.event_type, 'event_type'), stage = word(input.stage, 'stage', 40);
   const credits = mustInt(input.credits, 'credits', { min: 0, max: 1_000_000 });
+  assertCreditAmount(company, credits, 'This reward');
   const row = {
     stage_no: mustInt(input.stage_no ?? 1, 'stage_no', { min: 1, max: 20 }), credits,
     cap_month: mustInt(input.cap_month ?? 0, 'cap_month', { max: 10_000_000 }), cap_day: mustInt(input.cap_day ?? 0, 'cap_day', { max: 10_000_000 }),
@@ -63,6 +65,8 @@ export async function addTarget(ctx, company, actor, input) {
   if (!PERIODS.includes(input.period)) throw new ApiError(400, 'bad_period', 'Period is week, month, quarter, half or year.');
   const tiers = (input.tiers ?? []).map((t, i) => ({ idx: i + 1, count: mustInt(t.count, 'tier count', { min: 1, max: 1e6 }), bonus: mustInt(t.bonus, 'tier bonus', { min: 0, max: 1e7 }) }));
   if (!tiers.length) throw new ApiError(400, 'no_tiers', 'At least one tier is needed.');
+  for (const t of tiers) assertCreditAmount(company, t.bonus, 'A tier bonus');
+  if (input.streak) assertCreditAmount(company, input.streak.bonus, 'The streak bonus');
   for (let i = 1; i < tiers.length; i++) if (tiers[i].count <= tiers[i - 1].count || tiers[i].bonus < tiers[i - 1].bonus) throw new ApiError(400, 'bad_tiers', 'Tiers must rise in count and in total bonus.');
   const id = newId('pt');
   const stmts = [['INSERT INTO period_target (id, company_id, name, scope, period, event_type, stage, active_from, created_at) VALUES (?,?,?,?,?,?,?,?,?)', id, company.id, word(input.name, 'name', 80), input.scope === 'team' ? 'team' : 'person', input.period, word(input.event_type, 'event_type'), word(input.stage, 'stage', 40), input.active_from ?? ctx.now(), ctx.now()]];
@@ -161,6 +165,7 @@ export async function addNoteCard(ctx, company, actor, { text, effect = 'message
   must(actor, 'admin');
   if (!['message', 'credits', 'steps', 'points'].includes(effect)) throw new ApiError(400, 'bad_effect', 'A note can only give: a message, credits, steps or points.');
   const a = mustInt(amount, 'amount', { min: 0, max: effect === 'credits' ? 10_000 : 1000 }); // never a loss
+  if (effect === 'credits') assertCreditAmount(company, a, 'A card credit');
   await commit(ctx, company.id, actor.id, 'note.add', { effect, amount: a }, [['INSERT INTO note_card (id, company_id, kind, text, effect, amount, order_no) VALUES (?,?,?,?,?,?,?)', newId('nc'), company.id, kind === 'team' ? 'team' : 'note', word(text, 'text', 240), effect, a, order_no]]);
 }
 export async function addDesk(ctx, company, actor, { square_idx, name, target_id, price_points = 200, base_fee = 20 }) {
@@ -283,6 +288,14 @@ export async function finishOrders(ctx, company) {
       const rel = await intend(ctx, company, { kind: 'order_release', key: 'orel:' + op.subject, subject: op.subject, params: { hold: res.result.hold_id } });
       const out = await run(ctx, company, rel, (p) => prov.releaseSpend({ holdId: p.hold, idem: 'orel:' + op.subject }), { okCodes: ['hold_expired'], believeRefusal: false });
       if (out.state === 'landed') { await settleOp(ctx, rel); await settleOp(ctx, op); n++; }
+    } catch (e) { if (!(e instanceof ProviderError)) throw e; }
+  }
+  // A hold that has to go back (a declined order, a lost reservation) is released until the provider confirms: the clock drives it, as the alert says.
+  for (const op of await unsettled(ctx, company.id, 'order_release')) {
+    try {
+      const prov = ctx.provider(company);
+      const out = await run(ctx, company, op, (p) => prov.releaseSpend({ holdId: p.hold, idem: op.key }), { okCodes: ['hold_expired'], believeRefusal: false });
+      if (out.state === 'landed') { await settleOp(ctx, op); n++; }
     } catch (e) { if (!(e instanceof ProviderError)) throw e; }
   }
   return n;

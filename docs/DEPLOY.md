@@ -69,6 +69,9 @@ The game does nothing by itself. Retries, releases, reversals, penalty notices a
 The admin overview shows last_tick_at and raises an alert when nothing ran for over an hour.
 
 ## Moneypenny caps versus game caps
+No single credit may exceed 500 (manual_bonus_max): the game refuses such an amount when it is set up. A failed or partially granted reward is never retried by itself: check the Moneypenny ledger, then re-issue it from the admin overview (reissue, with the confirm flag).
+Rotating the Moneypenny key: calls whose answer was lost are retried under the same idempotency key; after a key rotation that key may be rejected (idempotency_conflict, shown as a provider problem). Let the queue empty (nothing 'on its way') before you rotate.
+
 Moneypenny's own default limits are: lifetime 800 credits per person, manual bonus maximum 500, 20 events per person per day. The game's defaults are higher (season cap per person 15000, event cap 1000, daily event limit 60). Where the game promises more than Moneypenny grants, Moneypenny grants only part: the row is recorded as a partial grant and the remainder is retried every 6 hours (up to 20 times); the admin overview lists open_partial_grants. Raise Moneypenny's limits for the tenant or lower the game caps: the overview shows a warning for each game cap above these numbers (no network call; the numbers are in src/config.js, MNP_LIMITS).
 
 ## Shop orders and expiring holds

@@ -11,8 +11,14 @@ export const futureOn = (env, company) => String(env?.FUTURE_OPS) === '1' && !co
 export function assertStartup(env) {
   if (String(env?.FUTURE_OPS) === '1' && isProd(env)) throw new Error('FUTURE_OPS is a test-only switch and must not be set in production: hold, debit and reverse are not enabled in v1.');
 }
+/** Moneypenny grants at most 500 credits in ONE bonus (manual_bonus_max). v1 does not split a credit: anything above is refused when it is configured (and again, as a safety net, when it would be sent). */
+export const MAX_SINGLE_CREDIT = 500;
+export function assertCreditAmount(company, n, what) {
+  if (company?.provider === 'moneypenny' && Number(n) > MAX_SINGLE_CREDIT) throw new ApiError(400, 'above_provider_max', `${what} (${n}) is above Moneypenny's single bonus maximum (${MAX_SINGLE_CREDIT}). Use a smaller amount.`);
+}
 /** A company setting that would enable credit-loss penalties is refused while the future abilities are off. */
 export function assertV1Settings(env, company, patch) {
+  if (patch) for (const k of ['cap_event', 'lap_bonus_credits']) if (patch[k] !== undefined) assertCreditAmount(company, patch[k], 'The setting ' + k);
   if (patch && (patch.penalty_credit_loss === true || patch.penalty_credit_loss === 'true') && !futureOn(env, company)) {
     throw new ApiError(409, 'not_enabled_in_v1', 'Credit-loss penalties are not enabled in v1 (penalties are points and steps only).');
   }

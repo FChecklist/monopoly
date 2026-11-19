@@ -98,7 +98,7 @@ export class MoneypennyProvider {
   }
   async history({ accountRef, limit = 50 }) {
     const { json } = await this.#call('GET', `/v1/history?email=${encodeURIComponent(accountRef)}&limit=${limit}`);
-    return { lines: (json.entries ?? json.lines ?? []).map((e) => ({ entry_id: e.id ?? e.seq, kind: e.kind, amount: e.delta, ref: e.ext_ref, at: e.at })) };
+    return { lines: (json.entries ?? json.lines ?? []).map((e) => ({ entry_id: e.id ?? e.seq, kind: e.kind, amount: e.delta, ref: e.ref ?? e.ext_ref, at: e.at })) };
   }
   async reserveSpend({ accountRef, amount, ref, idem, item }) {
     const { json } = await this.#call('POST', '/v1/spend/reserve_item', { email: accountRef, product: this.cfg.product ?? 'floor', item: item ?? ref, order_ref: ref, credits: amount }, idem);
