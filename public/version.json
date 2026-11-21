@@ -1,0 +1,14 @@
+{
+  "product": "office floor game (product code MON, code name floor)",
+  "version": "0.1.0",
+  "releasedAt": "2026-11-19T17:18:27Z",
+  "releasedAtIST": "2026-11-19 22:48 IST",
+  "commit": "c505465b98ac3703633a13c221336aeadb2e0911",
+  "changes": [
+    {
+      "version": "0.1.0",
+      "releasedAt": "2026-11-19T17:18:27Z",
+      "notes": "First numbered version. It describes the code as it stands at commit c505465 (after audit round 28). The date is the date of that commit. It is NOT deployed and no company is live. Version numbering starts here; the earlier history is in CHANGELOG.md."
+    }
+  ]
+}

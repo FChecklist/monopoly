@@ -10,6 +10,7 @@ All rights reserved (see LICENSE). Independent product. Not made by or linked to
 * Stack: Cloudflare Pages Functions + D1 (free tier), plain JavaScript, no build step.
 * Local: `node scripts/dev-server.js` (node 22.5+), then open http://localhost:8788. `npm test` runs every test.
 * Deploy and roll back: `docs/DEPLOY.md`, `docs/ROLLBACK.md`.
+* Version history: `CHANGELOG.md` (current version also in `public/version.json`).
 * Borders and example messages: `CONTRACT/`. Design: the owner's design report (not in this repo).
 * The product name is a config string (`src/config.js`, `product_name` setting). Code, tables and routes use the neutral name `floor`.
 * Currency: the unit name, symbol, rate and local currency are company settings (`unit_name`, `unit_symbol`, `credits_per_usd`,
