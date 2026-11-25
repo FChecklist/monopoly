@@ -4,7 +4,7 @@ Short facts for anyone picking this product up. The long handover (audit rounds,
 Deploy and roll back: `docs/DEPLOY.md`, `docs/ROLLBACK.md`.
 
 ## Version
-- Current version: **0.1.0** (see `CHANGELOG.md`). Not deployed; no company is live.
+- Current version: **0.1.1** (see `CHANGELOG.md`). Not deployed; no company is live.
 - Where it lives:
   - `public/version.json` (served as a static file at `/version.json` once deployed; `public/` is the Pages output folder in `wrangler.toml`).
   - `package.json` `version` field (must match).

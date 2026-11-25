@@ -3,7 +3,11 @@
 Newest first. Dates are in IST (Indian Standard Time). Every deployed change gets a new version number
 (MAJOR.MINOR.PATCH), a new entry here, an updated `public/version.json` and an updated `KNOWLEDGE.md`, all in the same pull request.
 
-## 0.1.0 - 19 Nov 2026 (current)
+## 0.1.1 - 25 Nov 2026 (current)
+- Added the small mark "१३९" (Devanagari numerals, 6px bold dark blue, thin dark red line under it) at the very top centre of the page, by owner order of 25 Nov 2026. It does not move content, ignores clicks and is hidden from screen readers.
+- Added a guard test (`test/mark139.test.js`). No other behaviour changed. NOT deployed.
+
+## 0.1.0 - 19 Nov 2026
 - First numbered version. It describes the code as it stands at commit `c505465` (after audit round 28). The date is the date of that commit.
 - NOT deployed. Deploy is on hold. No company is live. The product only pays plain credits (credit-only v1).
 - No code changed to create this version: only version files were added (`CHANGELOG.md`, `KNOWLEDGE.md`, `public/version.json`).
