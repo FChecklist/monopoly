@@ -1,10 +1,15 @@
 {
   "product": "office floor game (product code MON, code name floor)",
-  "version": "0.1.0",
-  "releasedAt": "2026-11-19T17:18:27Z",
-  "releasedAtIST": "2026-11-19 22:48 IST",
+  "version": "0.1.1",
+  "releasedAt": "2026-11-25T00:00:00Z",
+  "releasedAtIST": "2026-11-25 05:30 IST",
   "commit": "c505465b98ac3703633a13c221336aeadb2e0911",
   "changes": [
+    {
+      "version": "0.1.1",
+      "releasedAt": "2026-11-25T00:00:00Z",
+      "notes": "Added the small mark 139 in Devanagari numerals at the top centre of the page (owner order, 25 Nov 2026). No other change. NOT deployed."
+    },
     {
       "version": "0.1.0",
       "releasedAt": "2026-11-19T17:18:27Z",

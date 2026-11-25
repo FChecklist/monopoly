@@ -1,6 +1,6 @@
 {
   "name": "corporate-floor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Office target and reward game. Standalone product. Talks to a credit provider only through one adapter. Stores no credit balances.",
